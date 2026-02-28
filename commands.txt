@@ -1,3 +1,4 @@
+sudo ufw disable
 python3 ws_console.py --host 0.0.0.0 --port 8000
 
 ping train-01
@@ -15,3 +16,5 @@ python ble_provisioning.py \
   --tele-port 8000 \
   --ws-port 8000 \
   --show-json
+  
+fota train-01 ../lego_esp32cam/build/lego_esp32cam.bin
