@@ -1,0 +1,21 @@
+{
+  "aruco": {
+    "dict": "4X4_50",
+    "marker_size_m": 0.04
+  },
+  "net": {
+    "listen_ip": "0.0.0.0",
+    "port": 5000,
+    "source_ip": ""
+  },
+  "range": {
+    "calib_dist_m": 0.5,
+    "cooldown_s": 0.6,
+    "ema_alpha": 0.35,
+    "k_area": 13.900465304318942,
+    "th_approach_m": 0.6,
+    "th_brake_m": 0.35,
+    "th_stop_m": 0.2
+  },
+  "version": 1
+}

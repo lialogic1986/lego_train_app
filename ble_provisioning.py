@@ -1,478 +1,418 @@
 #!/usr/bin/env python3
+# ble_provisioning.py
+
 import argparse
 import asyncio
-import hashlib
 import json
 import os
+import random
 import socket
-import sys
-import threading
+import struct
 import time
-from dataclasses import dataclass, field
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Dict, Optional, Any, Tuple
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
 
-import websockets
-from websockets.legacy.server import serve, WebSocketServerProtocol
+from bleak import BleakClient, BleakScanner
+from bleak.backends.device import BLEDevice
+from bleak.backends.scanner import AdvertisementData
 
 
-# -------------------- helpers --------------------
+# ====== UUIDs: MUST match prov_ble.c ======
+UUID_PROV_SVC = "0110a133-147b-6e92-264d-8b6f2b107c9a"
+UUID_INFO_CHR = "0210a133-147b-6e92-264d-8b6f2b107c9a"
+UUID_CFG_RX    = "0310a133-147b-6e92-264d-8b6f2b107c9a"
+UUID_STATUS_TX = "0410a133-147b-6e92-264d-8b6f2b107c9a"
+UUID_CMD       = "0510a133-147b-6e92-264d-8b6f2b107c9a"
 
-def guess_host_ip() -> str:
+CMD_COMMIT = b"\x01"
+CMD_ABORT  = b"\x02"
+
+
+def now_unix_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def mask_secret(s: str) -> str:
+    if not s:
+        return ""
+    if len(s) <= 2:
+        return "*" * len(s)
+    return s[0] + ("*" * (len(s) - 2)) + s[-1]
+
+
+def _get_local_ip_via_route(peer_ip: str) -> Tuple[str, str]:
     """
-    Fallback: определяет IP по default route (может быть неверно при нескольких интерфейсах/VPN).
+    Determine source IP chosen by OS routing toward peer_ip.
+    Works on Linux/Windows/macOS.
     """
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-    except Exception:
-        return "127.0.0.1"
-    finally:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect((peer_ip, 9))  # no packets sent for UDP connect
+        ip = s.getsockname()[0]
         s.close()
+        return ip, f"route-to-{peer_ip}"
+    except Exception as e:
+        return "127.0.0.1", f"route-to-{peer_ip}-failed:{type(e).__name__}"
 
 
-def local_ip_for_peer(peer_ip: str) -> str:
+def _linux_default_iface() -> Optional[str]:
     """
-    Надёжно определяет локальный IP, который ОС выберет для маршрута к peer_ip.
-    Это ровно тот интерфейс/IP, через который реально ходит трафик к устройству.
+    Linux-only: read /proc/net/route to get interface for default route.
     """
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s.connect((peer_ip, 9))  # порт не важен, пакеты не шлём
-        return s.getsockname()[0]
+        with open("/proc/net/route", "r", encoding="utf-8") as f:
+            # Iface  Destination Gateway Flags RefCnt Use Metric Mask ...
+            for line in f.readlines()[1:]:
+                parts = line.strip().split()
+                if len(parts) >= 2:
+                    iface, dest = parts[0], parts[1]
+                    if dest == "00000000":
+                        return iface
     except Exception:
-        return guess_host_ip()
-    finally:
+        return None
+    return None
+
+
+def _get_ipv4_of_iface_linux(iface: str) -> Optional[str]:
+    """
+    Linux-only: best-effort IP discovery for iface without extra deps.
+    Uses socket + ioctl if available, else None.
+    """
+    import fcntl  # Linux-only
+    import struct as _struct
+
+    SIOCGIFADDR = 0x8915
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        ifreq = _struct.pack("256s", iface.encode("utf-8")[:15])
+        res = fcntl.ioctl(s.fileno(), SIOCGIFADDR, ifreq)
+        ip = socket.inet_ntoa(res[20:24])
         s.close()
+        return ip
+    except Exception:
+        return None
 
 
-def sha256_file(path: str) -> Tuple[str, int]:
-    h = hashlib.sha256()
-    size = 0
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(1024 * 1024)
-            if not chunk:
-                break
-            h.update(chunk)
-            size += len(chunk)
-    return h.hexdigest(), size
+def get_host_ip(auto_peer: str = "1.1.1.1", prefer_iface: Optional[str] = None) -> Tuple[str, str]:
+    """
+    Returns (ip, reason).
+    Strategy:
+      1) If prefer_iface (Linux): get IPv4 for that iface
+      2) If Linux: take iface of default route from /proc/net/route and get its IPv4
+      3) Fallback: OS route selection to auto_peer (default 1.1.1.1)
+    """
+    # 1) Linux prefer iface
+    if prefer_iface:
+        if os.name == "posix":
+            ip = _get_ipv4_of_iface_linux(prefer_iface)
+            if ip:
+                return ip, f"iface:{prefer_iface}"
+        # if non-linux, ignore
 
+    # 2) Linux default route iface
+    if os.name == "posix":
+        iface = _linux_default_iface()
+        if iface:
+            ip = _get_ipv4_of_iface_linux(iface)
+            if ip:
+                return ip, f"default-route-iface:{iface}"
 
-# -------------------- one-shot http server --------------------
-
-class OneFileHandler(BaseHTTPRequestHandler):
-    file_path: str = ""
-    url_path: str = "/fw.bin"
-
-    def do_GET(self):
-        if self.path.split("?", 1)[0] != self.url_path:
-            self.send_error(404, "Not Found")
-            return
-
-        try:
-            st = os.stat(self.file_path)
-            total = st.st_size
-            rng = self.headers.get("Range") or self.headers.get("range")
-
-            start, end = 0, total - 1
-            status = 200
-            if rng and rng.startswith("bytes="):
-                spec = rng[len("bytes="):].strip()
-                a, b = spec.split("-", 1)
-                if a:
-                    start = int(a)
-                if b:
-                    end = int(b)
-                if start < 0 or end < start or end >= total:
-                    self.send_response(416)
-                    self.send_header("Content-Range", f"bytes */{total}")
-                    self.end_headers()
-                    return
-                status = 206
-
-            length = end - start + 1
-
-            self.send_response(status)
-            self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Accept-Ranges", "bytes")
-            self.send_header("Content-Length", str(length))
-            if status == 206:
-                self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
-            self.end_headers()
-
-            with open(self.file_path, "rb") as f:
-                f.seek(start)
-                remaining = length
-                while remaining > 0:
-                    chunk = f.read(min(64 * 1024, remaining))
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-                    remaining -= len(chunk)
-
-        except Exception as e:
-            self.send_error(500, f"Error: {e}")
-
-    def log_message(self, fmt, *args):
-        return
+    # 3) cross-platform fallback: route selection to peer
+    ip, reason = _get_local_ip_via_route(auto_peer)
+    return ip, reason
 
 
 @dataclass
-class TempHttpServer:
-    host: str
-    port: int
-    file_path: str
-    url_path: str = "/fw.bin"
+class ProvisioningConfig:
+    ssid: str
+    password: str
+    host_ip: str
+    ports: Dict[str, int]
+    unix_ms: int
 
-    _srv: Optional[ThreadingHTTPServer] = None
-    _thr: Optional[threading.Thread] = None
+    def as_payload_dict(self, train_id: Optional[str] = None) -> Dict:
+        payload = {
+            "v": 1,
+            "wifi": {"ssid": self.ssid, "pass": self.password},
+            "host": {"ip": self.host_ip, "ports": self.ports},
+            "time": {"unix_ms": self.unix_ms},
+        }
+        if train_id:
+            payload["train_id"] = train_id
+        return payload
 
-    def start(self) -> int:
-        handler_cls = type(
-            "OneFileHandlerBound",
-            (OneFileHandler,),
-            {"file_path": self.file_path, "url_path": self.url_path},
-        )
-        self._srv = ThreadingHTTPServer((self.host, self.port), handler_cls)
-        actual_port = self._srv.server_address[1]
-
-        def run():
-            try:
-                self._srv.serve_forever()
-            except Exception:
-                pass
-
-        self._thr = threading.Thread(target=run, daemon=True)
-        self._thr.start()
-        return actual_port
-
-    def stop(self):
-        if self._srv:
-            try:
-                self._srv.shutdown()
-            except Exception:
-                pass
-            try:
-                self._srv.server_close()
-            except Exception:
-                pass
-        self._srv = None
-        self._thr = None
+    def to_json_bytes(self, train_id: Optional[str] = None) -> bytes:
+        s = json.dumps(self.as_payload_dict(train_id=train_id),
+                       separators=(",", ":"), ensure_ascii=False)
+        return s.encode("utf-8")
 
 
-# -------------------- WS console server --------------------
+class BleProvisioner:
+    def __init__(
+        self,
+        name_prefix: str = "Train-",
+        scan_window_s: float = 2.0,
+        connect_timeout_s: float = 10.0,
+        op_timeout_s: float = 20.0,
+        chunk_size: int = 160,
+        cooldown_s: float = 1.5,
+        verbose: bool = True,
+        show_json_per_device: bool = False,
+        hide_password: bool = False,
+    ):
+        self.name_prefix = name_prefix
+        self.scan_window_s = scan_window_s
+        self.connect_timeout_s = connect_timeout_s
+        self.op_timeout_s = op_timeout_s
+        self.chunk_size = chunk_size
+        self.cooldown_s = cooldown_s
+        self.verbose = verbose
+        self.show_json_per_device = show_json_per_device
+        self.hide_password = hide_password
+        self._seen_recent: Dict[str, float] = {}
 
-@dataclass
-class DeviceConn:
-    device_id: str
-    ws: WebSocketServerProtocol
-    last_seen: float = field(default_factory=time.time)
-    peer_ip: str = ""
-
-
-class ConsoleServer:
-    def __init__(self, out_path: Optional[str] = None, host_ip_override: Optional[str] = None):
-        self.devices: Dict[str, DeviceConn] = {}
-        self.active_device: Optional[str] = None
-        self.cmd_seq = 0
-
-        self.pending_cmd: Dict[str, asyncio.Future] = {}
-
-        self.out_fp = open(out_path, "a", buffering=1, encoding="utf-8") if out_path else None
-        self._shutdown = asyncio.Event()
-
-        self.host_ip_override = host_ip_override
-
-    def log(self, line: str) -> None:
-        ts = time.strftime("%H:%M:%S")
-        s = f"[{ts}] {line}"
-        print(s, flush=True)
-        if self.out_fp:
-            self.out_fp.write(s + "\n")
+    def _log(self, *a):
+        if self.verbose:
+            print(*a, flush=True)
 
     @staticmethod
-    def _compact(obj: Any) -> str:
-        try:
-            return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
-        except Exception:
-            return str(obj)
+    def _extract_name(device: BLEDevice, adv: Optional[AdvertisementData]) -> Optional[str]:
+        if device.name:
+            return device.name
+        if adv and adv.local_name:
+            return adv.local_name
+        return None
 
-    def parse_path(self, path: str) -> Tuple[Optional[str], Optional[str]]:
-        parts = path.strip("/").split("/")
-        if len(parts) == 2 and parts[0] == "ws" and parts[1]:
-            return "ws", parts[1]
-        return None, None
+    def _match_train(self, device: BLEDevice, adv: Optional[AdvertisementData]) -> Optional[str]:
+        name = self._extract_name(device, adv)
+        if name and name.startswith(self.name_prefix):
+            return name
+        return None
 
-    def next_cmd_id(self) -> str:
-        self.cmd_seq += 1
-        return str(self.cmd_seq)
+    def _mark_seen(self, addr: str):
+        self._seen_recent[addr] = time.time()
 
-    async def ws_handler(self, ws: WebSocketServerProtocol, path: str):
-        kind, device_id = self.parse_path(path)
-        if kind != "ws" or not device_id:
-            self.log(f"reject path={path!r} from {ws.remote_address}")
-            await ws.close(code=1008, reason="Bad path. Use /ws/<device_id>")
-            return
+    def _recently_processed(self, addr: str) -> bool:
+        ts = self._seen_recent.get(addr)
+        return ts is not None and (time.time() - ts) < 12.0
 
-        peer_ip = ""
-        try:
-            peer_ip = ws.remote_address[0] if ws.remote_address else ""
-        except Exception:
-            peer_ip = ""
-
-        self.devices[device_id] = DeviceConn(device_id=device_id, ws=ws, peer_ip=peer_ip)
-        if self.active_device is None:
-            self.active_device = device_id
-
-        self.log(f"{device_id} connected from {ws.remote_address} peer_ip={peer_ip} (active={self.active_device})")
-
-        try:
-            async for raw in ws:
-                self.devices[device_id].last_seen = time.time()
-                try:
-                    msg = json.loads(raw)
-                    if isinstance(msg, dict):
-                        self.on_msg(device_id, msg)
-                    else:
-                        self.log(f"{device_id}  (non-dict json) {self._compact(msg)}")
-                except Exception:
-                    self.log(f"{device_id}  (text) {raw}")
-        except websockets.ConnectionClosed as e:
-            self.log(f"{device_id} disconnected ({e.code}: {e.reason})")
-        except Exception as e:
-            self.log(f"{device_id} handler error: {e!r}")
-        finally:
-            self.devices.pop(device_id, None)
-            if self.active_device == device_id:
-                self.active_device = next(iter(self.devices.keys()), None)
-                self.log(f"active device -> {self.active_device}")
-
-    def on_msg(self, device_id: str, msg: Dict[str, Any]) -> None:
-        mtype = msg.get("type", "unknown")
-
-        if mtype == "hb":
-            self.log(f"{device_id}  ♥ hb  uptime_ms={msg.get('uptime_ms')}  raw={self._compact(msg)}")
-            return
-
-        if mtype == "log":
-            self.log(f"{device_id}  🪵 {msg.get('msg','')}")
-            return
-
-        if mtype == "ota_status":
-            self.log(f"{device_id}  ⬆️ ota_status {self._compact(msg)}")
-            return
-
-        if mtype == "cmd_result":
-            cid = str(msg.get("id"))
-            ok = msg.get("ok")
-            if ok:
-                self.log(f"{device_id}  ✅ cmd_result id={cid} result={msg.get('result')}")
-            else:
-                self.log(f"{device_id}  ❌ cmd_result id={cid} error={msg.get('error')}")
-
-            fut = self.pending_cmd.pop(cid, None)
-            if fut and not fut.done():
-                fut.set_result(msg)
-            return
-
-        self.log(f"{device_id}  📦 {self._compact(msg)}")
-
-    async def send_to(self, device_id: str, payload: Dict[str, Any]) -> None:
-        if device_id not in self.devices:
-            self.log(f"Device not connected: {device_id}")
-            return
-        try:
-            await self.devices[device_id].ws.send(json.dumps(payload, ensure_ascii=False))
-        except Exception as e:
-            self.log(f"Send failed: {e!r}")
-
-    async def send_cmd_and_wait(self, device_id: str, name: str, args: Dict[str, Any], timeout_s: int = 180) -> Dict[str, Any]:
-        cid = self.next_cmd_id()
-        payload = {"type": "cmd", "id": cid, "name": name, "args": args}
-
-        loop = asyncio.get_running_loop()
-        fut = loop.create_future()
-        self.pending_cmd[cid] = fut
-
-        await self.send_to(device_id, payload)
-
-        try:
-            res = await asyncio.wait_for(fut, timeout=timeout_s)
-            return res
-        except asyncio.TimeoutError:
-            self.pending_cmd.pop(cid, None)
-            raise
-
-    def print_help(self):
-        self.log("Commands:")
-        self.log("  devices                                    - list connected devices")
-        self.log("  use <device_id>                            - switch active device")
-        self.log("  raw <device_id> {json}                     - send raw JSON to device")
-        self.log("  fota <device_id> <bin_path>                - start temp HTTP, send fota cmd, wait result, stop HTTP")
-        self.log("       example: fota train-01 build/lego_esp32cam.bin")
-        self.log("  help                                       - show this help")
-        self.log("  exit / quit                                - stop")
-
-    async def console_loop(self):
-        self.print_help()
-        loop = asyncio.get_running_loop()
-
-        while not self._shutdown.is_set():
+    async def run_forever(self, cfg: ProvisioningConfig) -> None:
+        self._log(f"[prov] scanning for devices with prefix {self.name_prefix!r} ...")
+        while True:
             try:
-                line = await loop.run_in_executor(None, sys.stdin.readline)
-            except (EOFError, KeyboardInterrupt):
-                self._shutdown.set()
-                break
-
-            if not line:
-                self._shutdown.set()
-                break
-
-            line = line.strip()
-            if not line:
-                continue
-
-            cmd, *rest = line.split()
-            cmd = cmd.lower()
-
-            if cmd in ("quit", "exit"):
-                self._shutdown.set()
-                break
-
-            if cmd == "help":
-                self.print_help()
-                continue
-
-            if cmd == "devices":
-                if not self.devices:
-                    self.log("No devices connected.")
-                else:
-                    for did, dc in self.devices.items():
-                        age = time.time() - dc.last_seen
-                        mark = "*" if did == self.active_device else " "
-                        self.log(f"{mark} {did}  peer_ip={dc.peer_ip}  last_seen={age:.1f}s ago")
-                continue
-
-            if cmd == "use":
-                if not rest:
-                    self.log("Usage: use <device_id>")
+                target = await self._scan_once()
+                if target is None:
+                    await asyncio.sleep(0.2)
                     continue
-                did = rest[0]
-                if did not in self.devices:
-                    self.log(f"Device not connected: {did}")
-                    continue
-                self.active_device = did
-                self.log(f"active device -> {did}")
-                continue
 
-            if cmd == "raw":
-                if len(rest) < 2:
-                    self.log("Usage: raw <device_id> {json}")
+                addr, name = target
+                if self._recently_processed(addr):
+                    await asyncio.sleep(0.2)
                     continue
-                did = rest[0]
-                raw_json = line.split(None, 2)[2]  # after "raw <did> "
+
+                self._log(f"[prov] found {name} ({addr}) -> provisioning...")
+                ok = await self._provision_one(addr, name, cfg)
+                self._mark_seen(addr)
+
+                self._log(f"[prov] {name} {'DONE ✅' if ok else 'FAILED ❌'}")
+                await asyncio.sleep(self.cooldown_s)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._log(f"[prov] loop error: {type(e).__name__}: {e}")
+                await asyncio.sleep(0.8)
+
+    async def _scan_once(self) -> Optional[Tuple[str, str]]:
+        found: Optional[Tuple[str, str]] = None
+
+        def detection_cb(device: BLEDevice, adv: AdvertisementData):
+            nonlocal found
+            if found is not None:
+                return
+            name = self._match_train(device, adv)
+            if name:
+                found = (device.address, name)
+
+        scanner = BleakScanner(detection_cb)
+        await scanner.start()
+        try:
+            await asyncio.sleep(self.scan_window_s)
+        finally:
+            await scanner.stop()
+
+        return found
+
+    async def _provision_one(self, address: str, train_name: str, cfg: ProvisioningConfig) -> bool:
+        payload = cfg.to_json_bytes(train_id=train_name)
+        session_id = random.getrandbits(32)
+
+        done_evt = asyncio.Event()
+        err_msg: Dict[str, str] = {"err": ""}
+
+        def on_status(_: int, data: bytearray):
+            s = bytes(data).decode("utf-8", errors="replace")
+            self._log(f"[{train_name}] status: {s}")
+            if s.startswith("ERROR"):
+                err_msg["err"] = s
+                done_evt.set()
+            elif "DONE" in s:
+                done_evt.set()
+
+        if self.show_json_per_device:
+            self._log(f"\n----- CONFIG for {train_name} -----")
+            if self.hide_password:
+                d = cfg.as_payload_dict(train_id=train_name)
+                d["wifi"]["pass"] = mask_secret(d["wifi"]["pass"])
+                self._log(json.dumps(d, indent=2, ensure_ascii=False))
+            else:
+                self._log(payload.decode("utf-8", errors="replace"))
+            self._log("----------------------------------\n")
+
+        try:
+            async with BleakClient(address, timeout=self.connect_timeout_s) as client:
+                await client.start_notify(UUID_STATUS_TX, on_status)
+
                 try:
-                    payload = json.loads(raw_json)
-                    if not isinstance(payload, dict):
-                        self.log("raw JSON must be an object/dict")
-                        continue
+                    info = await client.read_gatt_char(UUID_INFO_CHR)
+                    self._log(f"[{train_name}] INFO: {info.decode('utf-8', errors='replace')}")
+                except Exception:
+                    pass
+
+                await self._send_cfg_chunks(client, session_id, payload)
+
+                # COMMIT best-effort (no response)
+                try:
+                    await client.write_gatt_char(UUID_CMD, CMD_COMMIT, response=False)
+                    self._log(f"[{train_name}] COMMIT sent (no response)")
                 except Exception as e:
-                    self.log(f"Bad JSON: {e}")
-                    continue
-                await self.send_to(did, payload)
-                continue
-
-            if cmd == "fota":
-                if len(rest) < 2:
-                    self.log("Usage: fota <device_id> <bin_path>")
-                    continue
-
-                did = rest[0]
-                bin_path = rest[1]
-
-                if did not in self.devices:
-                    self.log(f"Device not connected: {did}")
-                    continue
-                if not os.path.isfile(bin_path):
-                    self.log(f"File not found: {bin_path}")
-                    continue
-
-                digest, size = sha256_file(bin_path)
-
-                peer_ip = self.devices[did].peer_ip
-                if self.host_ip_override:
-                    host_ip = self.host_ip_override
-                    why = "override"
-                else:
-                    host_ip = local_ip_for_peer(peer_ip) if peer_ip else guess_host_ip()
-                    why = f"route_to_peer({peer_ip})" if peer_ip else "fallback_guess"
-
-                http = TempHttpServer(host="0.0.0.0", port=0, file_path=bin_path, url_path="/fw.bin")
-                port = http.start()
-
-                url = f"http://{host_ip}:{port}/fw.bin"
-                self.log(f"FOTA using host_ip={host_ip} ({why}), peer_ip={peer_ip}")
-                self.log(f"FOTA HTTP UP: {url}")
-                self.log(f"  sha256={digest}")
-                self.log(f"  size={size} bytes")
+                    self._log(f"[{train_name}] COMMIT write failed (ignored): {type(e).__name__}: {e}")
 
                 try:
-                    args = {
-                        "url": url,
-                        "sha256": digest,
-                        "size": size,
-                    }
-                    res = await self.send_cmd_and_wait(did, "fota", args, timeout_s=900)
-
-                    ok = bool(res.get("ok"))
-                    if ok:
-                        self.log(f"FOTA OK for {did}")
-                    else:
-                        self.log(f"FOTA FAIL for {did}: {res.get('error')}")
+                    await asyncio.wait_for(done_evt.wait(), timeout=self.op_timeout_s)
                 except asyncio.TimeoutError:
-                    self.log("FOTA timeout waiting cmd_result")
+                    self._log(f"[{train_name}] timeout waiting DONE/ERROR")
+                    return False
                 finally:
-                    http.stop()
-                    self.log("FOTA HTTP DOWN")
-                continue
+                    try:
+                        await client.stop_notify(UUID_STATUS_TX)
+                    except Exception:
+                        pass
 
-            self.log("Unknown command. Type 'help'.")
+                if err_msg["err"]:
+                    self._log(f"[{train_name}] device error: {err_msg['err']}")
+                    return False
+                return True
 
-    async def run(self, host: str, port: int):
-        self.log(f"WS server listening on ws://{host}:{port}/ws/<device_id>")
-        if self.host_ip_override:
-            self.log(f"Host IP override: {self.host_ip_override} (used for FOTA HTTP URL)")
+        except Exception as e:
+            self._log(f"[{train_name}] connect/provision error: {type(e).__name__}: {e}")
+            return False
 
-        async with serve(
-            self.ws_handler,
-            host,
-            port,
-            ping_interval=None,
-            compression=None,
-            max_size=2 * 1024 * 1024,
-        ):
-            await self.console_loop()
+    async def _send_cfg_chunks(self, client: BleakClient, session_id: int, payload: bytes) -> None:
+        total_len = len(payload)
+        offset = 0
+        while offset < total_len:
+            chunk = payload[offset: offset + self.chunk_size]
+            hdr = struct.pack("<IHH", session_id, offset, total_len)
+            pkt = hdr + chunk
+            await client.write_gatt_char(UUID_CFG_RX, pkt, response=True)
+            offset += len(chunk)
+        await asyncio.sleep(0.05)
 
-        self.log("bye")
-        if self.out_fp:
-            self.out_fp.close()
+
+def print_config_banner(cfg: ProvisioningConfig, show_json: bool, hide_pass: bool, host_reason: str) -> None:
+    print("\n========== PROVISIONING CONFIG ==========")
+    print(f"SSID        : {cfg.ssid}")
+    print(f"Password    : {mask_secret(cfg.password) if hide_pass else cfg.password}")
+    print(f"Host IP     : {cfg.host_ip}   ({host_reason})")
+    print(f"Video port  : {cfg.ports.get('video')}")
+    print(f"Tele port   : {cfg.ports.get('tele')}")
+    print(f"WS port     : {cfg.ports.get('ws')}")
+    print(f"UTC ms      : {cfg.unix_ms}")
+    print("=========================================\n")
+
+    if show_json:
+        d = cfg.as_payload_dict(train_id="(per-device)")
+        if hide_pass:
+            d["wifi"]["pass"] = mask_secret(d["wifi"]["pass"])
+        print("JSON payload template:\n")
+        print(json.dumps(d, indent=2, ensure_ascii=False))
+        print()
+
+
+async def main_async():
+    ap = argparse.ArgumentParser(description="BLE provisioning for Train-* devices (bleak)")
+    ap.add_argument("--prefix", default=os.environ.get("TRAIN_PREFIX", "Train-"))
+    ap.add_argument("--ssid", default=os.environ.get("WIFI_SSID", ""))
+    ap.add_argument("--pass", dest="password", default=os.environ.get("WIFI_PASS", ""))
+    ap.add_argument("--host-ip", default=os.environ.get("HOST_IP", "auto"),
+                    help="Host IPv4: auto|<ip> (default auto)")
+    ap.add_argument("--host-ip-peer", default=os.environ.get("HOST_IP_PEER", "1.1.1.1"),
+                    help="Peer IP for route-based auto detect (default 1.1.1.1)")
+    ap.add_argument("--host-ip-iface", default=os.environ.get("HOST_IP_IFACE", ""),
+                    help="Linux: prefer interface name (e.g. wlp0s20f3)")
+
+    ap.add_argument("--video-port", type=int, default=int(os.environ.get("VIDEO_PORT", "5000")))
+    ap.add_argument("--tele-port", type=int, default=int(os.environ.get("TELE_PORT", "8000")))
+    ap.add_argument("--ws-port", type=int, default=int(os.environ.get("WS_PORT", "8000")))
+
+    ap.add_argument("--scan-window", type=float, default=2.0)
+    ap.add_argument("--connect-timeout", type=float, default=10.0)
+    ap.add_argument("--op-timeout", type=float, default=20.0)
+    ap.add_argument("--chunk", type=int, default=160)
+
+    ap.add_argument("--show-json", action="store_true")
+    ap.add_argument("--show-json-per-device", action="store_true")
+    ap.add_argument("--hide-pass", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--quiet", action="store_true")
+    args = ap.parse_args()
+
+    if not args.ssid or not args.password:
+        print("ERROR: --ssid and --pass are required (or set WIFI_SSID/WIFI_PASS env).")
+        raise SystemExit(2)
+
+    # Host IP selection
+    host_reason = ""
+    if args.host_ip and args.host_ip != "auto":
+        host_ip = args.host_ip.strip()
+        host_reason = "manual"
+    else:
+        host_ip, host_reason = get_host_ip(auto_peer=args.host_ip_peer, prefer_iface=(args.host_ip_iface or None))
+
+    cfg = ProvisioningConfig(
+        ssid=args.ssid,
+        password=args.password,
+        host_ip=host_ip,
+        ports={"video": args.video_port, "tele": args.tele_port, "ws": args.ws_port},
+        unix_ms=now_unix_ms(),
+    )
+
+    print_config_banner(cfg, show_json=args.show_json, hide_pass=args.hide_pass, host_reason=host_reason)
+
+    if args.dry_run:
+        print("Dry run complete. Exiting.")
+        return
+
+    prov = BleProvisioner(
+        name_prefix=args.prefix,
+        scan_window_s=args.scan_window,
+        connect_timeout_s=args.connect_timeout,
+        op_timeout_s=args.op_timeout,
+        chunk_size=args.chunk,
+        verbose=not args.quiet,
+        show_json_per_device=args.show_json_per_device,
+        hide_password=args.hide_pass,
+    )
+
+    await prov.run_forever(cfg)
 
 
 def main():
-    ap = argparse.ArgumentParser(description="WS console + one-shot FOTA (per-device routed host IP)")
-    ap.add_argument("--host", default="0.0.0.0")
-    ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--out", default=None, help="optional file to append full console output")
-    ap.add_argument("--host-ip", default=None, help="override IP that device should use for HTTP (FOTA)")
-    args = ap.parse_args()
-
-    srv = ConsoleServer(out_path=args.out, host_ip_override=args.host_ip)
     try:
-        asyncio.run(srv.run(args.host, args.port))
+        asyncio.run(main_async())
     except KeyboardInterrupt:
-        pass
+        print("\n[prov] stopped")
 
 
 if __name__ == "__main__":

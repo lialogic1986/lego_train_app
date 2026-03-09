@@ -18,3 +18,5 @@ python ble_provisioning.py \
   --show-json
   
 fota train-01 ../lego_esp32cam/build/lego_esp32cam.bin
+
+python viewer_udp_mjpeg_aruco_range.py --config host_config.json

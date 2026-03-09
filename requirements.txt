@@ -1,0 +1,4 @@
+websockets==16.0
+bleak
+opencv-python
+numpy
