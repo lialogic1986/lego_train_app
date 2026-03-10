@@ -1,0 +1,38 @@
+{
+  "common_services": [
+    {
+      "name": "ble_broker",
+      "argv": ["{python}", "ble_broker.py"]
+    }
+  ],
+
+  "camera_services": [
+    {
+      "name": "viewer.{camera_id}",
+      "argv": [
+        "{python}",
+        "viewer_udp_mjpeg_aruco_range.py",
+        "--config",
+        "host_config.json"
+      ]
+    },
+    {
+      "name": "ws_console.{camera_id}",
+      "argv": [
+        "{python}",
+        "ws_console.py",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "{ws_port}"
+      ]
+    }
+  ],
+
+  "train_services": [
+  {
+    "name": "trainctl.{train_id}",
+    "argv": ["{python}", "trainctl_rpc.py", "--train", "{train_id}"]
+  }
+  ]
+}
