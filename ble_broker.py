@@ -7,6 +7,7 @@ import signal
 import socket
 import struct
 import time
+import subprocess
 from dataclasses import dataclass
 from typing import Dict, Optional
 
@@ -51,11 +52,56 @@ def cmd_set_power(port: int, power: int) -> bytes:
 
 
 def get_host_ip(peer: str = "1.1.1.1") -> str:
+    """
+    fallback: определить IP через routing table
+    """
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.connect((peer, 9))
-    ip = s.getsockname()[0]
-    s.close()
-    return ip
+    try:
+        s.connect((peer, 9))
+        return s.getsockname()[0]
+    finally:
+        s.close()
+
+
+def find_lan_ip_192_168() -> Optional[str]:
+    """
+    ищет интерфейс с адресом 192.168.x.x
+    """
+    try:
+        out = subprocess.check_output(["ip", "-4", "addr", "show"], text=True)
+    except Exception:
+        return None
+
+    for line in out.splitlines():
+        line = line.strip()
+
+        if not line.startswith("inet "):
+            continue
+
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+
+        ip_cidr = parts[1]
+        ip = ip_cidr.split("/")[0]
+
+        if ip.startswith("192.168."):
+            return ip
+
+    return None
+
+
+def resolve_host_ip(prov: dict) -> str:
+    """
+    выбрать лучший IP для provisioning
+    """
+
+    ip = find_lan_ip_192_168()
+    if ip:
+        return ip
+
+    peer = str(prov.get("host_ip_peer", "1.1.1.1")).strip() or "1.1.1.1"
+    return get_host_ip(peer)
 
 
 @dataclass
@@ -260,7 +306,8 @@ class BLEBroker:
 
     def build_payload(self, cam: CameraState) -> bytes:
         prov = self.cfg["provisioning"]
-        host_ip = get_host_ip(prov.get("host_ip_peer", "1.1.1.1"))
+        host_ip = resolve_host_ip(prov)
+        self.log(f"[prov] {cam.name} host_ip={host_ip}")
 
         payload = {
             "v": 1,
@@ -304,24 +351,7 @@ class BLEBroker:
                 await self.provision_camera(cam)
 
             await asyncio.sleep(0.5)
-            
-    async def command_listener_loop(self):
-	    async for evt in self.bus.events():
 
-		t = evt["type"]
-		data = evt["data"]
-
-		if t == "train_power":
-
-		    slot = self.slots.get(data["train_id"])
-		    if slot and slot.lego_connected:
-		        await self.set_power(slot, int(data["power"]))
-
-		elif t == "train_brake":
-
-		    slot = self.slots.get(data["train_id"])
-		    if slot and slot.lego_connected:
-		        await self.set_power(slot, 0)
 
     async def provision_camera(self, cam: CameraState):
         cam.busy = True
@@ -418,6 +448,26 @@ class BLEBroker:
 
             await asyncio.sleep(0.3)
 
+    async def command_loop(self):
+        while not self._stop.is_set():
+            evt = await self.bus.next_event()
+            etype = evt.get("type")
+            data = evt.get("data", {})
+
+            if etype == "train_power":
+                train_id = data.get("train_id")
+                power = int(data.get("power", 0))
+
+                slot = self.slots.get(train_id)
+                if slot and slot.lego_connected and slot.lego_client:
+                    await self.set_power(slot, power)
+
+            elif etype in ("train_stop", "train_brake"):
+                train_id = data.get("train_id")
+                slot = self.slots.get(train_id)
+                if slot and slot.lego_connected and slot.lego_client:
+                    await self.set_power(slot, 0)
+                    
     async def start(self):
         await self.bus.connect()
 
@@ -426,7 +476,7 @@ class BLEBroker:
         self._tasks.append(asyncio.create_task(self.keepalive_loop()))
         self._tasks.append(asyncio.create_task(self.provisioning_loop()))
         self._tasks.append(asyncio.create_task(self.binding_loop()))
-        self._tasks.append(asyncio.create_task(self.command_listener_loop()))
+        self._tasks.append(asyncio.create_task(self.command_loop()))
 
     async def stop(self):
         self._stop.set()
@@ -435,7 +485,7 @@ class BLEBroker:
         await asyncio.gather(*self._tasks, return_exceptions=True)
         await self.bus.close()
 
-
+                    
 async def main():
     with open("ble_config.json", "r", encoding="utf-8") as f:
         cfg = json.load(f)

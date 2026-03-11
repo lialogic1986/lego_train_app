@@ -1,85 +1,96 @@
 #!/usr/bin/env python3
-
 import asyncio
 import json
 import uuid
-from typing import Any, Dict, Optional, Tuple
 
 import websockets
 
 
-BUS_URL = "ws://127.0.0.1:8765"
-
-
 class EventClient:
-
-    def __init__(self, source: str, url: str = BUS_URL):
-        self.source = source
+    def __init__(self, client_id: str, url: str = "ws://127.0.0.1:8765"):
+        self.client_id = client_id
         self.url = url
         self.ws = None
-
-        self.queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
-
-        self._reader_task: Optional[asyncio.Task] = None
-        self._pending: Dict[str, Tuple[str, asyncio.Future]] = {}
+        self._lock = asyncio.Lock()
 
     async def connect(self):
-        self.ws = await websockets.connect(self.url)
-        self._reader_task = asyncio.create_task(self._reader_loop())
+        while True:
+            try:
+                self.ws = await websockets.connect(self.url)
 
-    async def close(self):
-        if self._reader_task:
-            self._reader_task.cancel()
-            await asyncio.gather(self._reader_task, return_exceptions=True)
-            self._reader_task = None
+                # hello message для event_bus
+                await self.ws.send(json.dumps({
+                    "type": "hello",
+                    "client_id": self.client_id,
+                }))
 
-        if self.ws:
-            await self.ws.close()
-            self.ws = None
+                print(f"[{self.client_id}] connected to event_bus", flush=True)
+                return
 
-    async def _reader_loop(self):
-        async for raw in self.ws:
-            evt = json.loads(raw)
+            except Exception:
+                self.ws = None
+                print(f"[{self.client_id}] waiting for event_bus...", flush=True)
+                await asyncio.sleep(1.0)
 
-            req_id = evt.get("request_id")
-            evt_type = evt.get("type")
+    async def _ensure_connected(self):
+        if self.ws is None:
+            await self.connect()
 
-            if req_id and req_id in self._pending:
-                expected_type, fut = self._pending[req_id]
-
-                if not fut.done() and evt_type == expected_type:
-                    fut.set_result(evt)
-                    continue
-
-            await self.queue.put(evt)
-
-    async def emit(self, event_type: str, data: dict, request_id: str = ""):
-        evt = {
-            "type": event_type,
-            "source": self.source,
-            "ts": 0,
+    async def emit(self, etype: str, data: dict, request_id: str = ""):
+        msg = {
+            "type": etype,
             "data": data,
         }
-
         if request_id:
-            evt["request_id"] = request_id
+            msg["request_id"] = request_id
 
-        await self.ws.send(json.dumps(evt, ensure_ascii=False))
+        payload = json.dumps(msg)
 
+        async with self._lock:
+            await self._ensure_connected()
+            try:
+                await self.ws.send(payload)
+            except Exception:
+                self.ws = None
+                await self.connect()
+                await self.ws.send(payload)
 
-    async def request(self, event_type: str, data: dict, response_type: str, timeout: float = 10.0):
-        request_id = str(uuid.uuid4())
+    async def next_event(self):
+        while True:
+            await self._ensure_connected()
 
-        fut = asyncio.get_running_loop().create_future()
-        self._pending[request_id] = (response_type, fut)
+            try:
+                raw = await self.ws.recv()
+                return json.loads(raw)
 
-        try:
-            await self.emit(event_type, data, request_id=request_id)
-            result = await asyncio.wait_for(fut, timeout=timeout)
-            return result
-        finally:
-            self._pending.pop(request_id, None)
+            except Exception:
+                print(f"[{self.client_id}] reconnecting bus...", flush=True)
+                self.ws = None
+                await asyncio.sleep(0.2)
 
+    async def request(
+        self,
+        etype: str,
+        data: dict,
+        response_type: str,
+        timeout: float = 5.0,
+    ):
+        req_id = str(uuid.uuid4())
 
-    async def next_event(self) -> Dict[str, Any]:
-        return await self.queue.get()
+        await self.emit(etype, data, request_id=req_id)
+
+        async def _wait_reply():
+            while True:
+                evt = await self.next_event()
+                if evt.get("type") == response_type and evt.get("request_id") == req_id:
+                    return evt
+
+        return await asyncio.wait_for(_wait_reply(), timeout=timeout)
+
+    async def close(self):
+        if self.ws is not None:
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
+            self.ws = None
