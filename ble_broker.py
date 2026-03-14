@@ -52,9 +52,6 @@ def cmd_set_power(port: int, power: int) -> bytes:
 
 
 def get_host_ip(peer: str = "1.1.1.1") -> str:
-    """
-    fallback: определить IP через routing table
-    """
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect((peer, 9))
@@ -64,9 +61,6 @@ def get_host_ip(peer: str = "1.1.1.1") -> str:
 
 
 def find_lan_ip_192_168() -> Optional[str]:
-    """
-    ищет интерфейс с адресом 192.168.x.x
-    """
     try:
         out = subprocess.check_output(["ip", "-4", "addr", "show"], text=True)
     except Exception:
@@ -92,10 +86,6 @@ def find_lan_ip_192_168() -> Optional[str]:
 
 
 def resolve_host_ip(prov: dict) -> str:
-    """
-    выбрать лучший IP для provisioning
-    """
-
     ip = find_lan_ip_192_168()
     if ip:
         return ip
@@ -137,6 +127,7 @@ class BLEBroker:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.scan_window = float(cfg.get("cam", {}).get("scan_window_s", 2.0))
+        self.offline_after_ms = int(float(cfg.get("cam", {}).get("offline_after_s", 5.0)) * 1000)
         self.bus = EventClient("ble_broker")
 
         self.slots: Dict[str, TrainSlot] = {}
@@ -233,14 +224,16 @@ class BLEBroker:
             ts = now_ms()
 
             for cam in self.cameras.values():
-                if cam.online and ts - cam.last_seen > 5000:
-                    cam.provisioned = False
-                    cam.bound_slot = None
-                    for slot in self.slots.values():
-                        if slot.camera_key == cam.key:
-                            slot.camera_key = None
+                if cam.online and ts - cam.last_seen > self.offline_after_ms:
                     self.log("[cam] offline", cam.name)
                     cam.online = False
+                    await self.bus.emit(
+                        "camera_offline",
+                        {
+                            "camera_id": cam.name,
+                            "camera_addr": cam.addr,
+                        },
+                    )
 
             await asyncio.sleep(1.0)
 
@@ -283,6 +276,10 @@ class BLEBroker:
         msg = cmd_set_power(slot.motor_port, power)
         await slot.lego_client.write_gatt_char(LEGO_CHAR_UUID, msg)
         slot.power = power
+        await self.bus.emit(
+            "train_state",
+            {"train_id": slot.slot_id, "power": slot.power},
+        )
 
     async def keepalive_loop(self):
         while not self._stop.is_set():
@@ -293,6 +290,16 @@ class BLEBroker:
                 try:
                     msg = cmd_set_power(slot.motor_port, slot.power)
                     await slot.lego_client.write_gatt_char(LEGO_CHAR_UUID, msg)
+
+                # heartbeat для GUI: подтверждаем, что поезд всё ещё жив
+                    await self.bus.emit(
+                        "train_state",
+                        {
+                            "train_id": slot.slot_id,
+                            "power": slot.power,
+                        },
+                    )
+
                 except Exception:
                     self.log("[lego] disconnected", slot.slot_id)
                     slot.lego_connected = False
@@ -351,7 +358,6 @@ class BLEBroker:
                 await self.provision_camera(cam)
 
             await asyncio.sleep(0.5)
-
 
     async def provision_camera(self, cam: CameraState):
         cam.busy = True
@@ -467,7 +473,7 @@ class BLEBroker:
                 slot = self.slots.get(train_id)
                 if slot and slot.lego_connected and slot.lego_client:
                     await self.set_power(slot, 0)
-                    
+
     async def start(self):
         await self.bus.connect()
 
@@ -485,7 +491,7 @@ class BLEBroker:
         await asyncio.gather(*self._tasks, return_exceptions=True)
         await self.bus.close()
 
-                    
+
 async def main():
     with open("ble_config.json", "r", encoding="utf-8") as f:
         cfg = json.load(f)

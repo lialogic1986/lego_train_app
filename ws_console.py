@@ -1,461 +1,607 @@
 #!/usr/bin/env python3
+
+import argparse
 import asyncio
+import hashlib
+import json
 import os
-import queue
+import socket
+import sys
 import threading
 import time
-import tkinter as tk
 from dataclasses import dataclass, field
-from tkinter import ttk
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Dict, Optional, Tuple
+
+import websockets
+from websockets.legacy.server import WebSocketServerProtocol, serve
 
 from event_client import EventClient
 
 
-MODULE_OFFLINE_TIMEOUT = 10.0
-SECTION_REMOVE_TIMEOUT = 30.0
-POWER_STEP = 10
-POWER_MIN = -100
-POWER_MAX = 100
+def guess_host_ip() -> str:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
 
 
-def clamp_power(v: int) -> int:
-    return max(POWER_MIN, min(POWER_MAX, int(v)))
+def local_ip_for_peer(peer_ip: str) -> str:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect((peer_ip, 9))
+        return s.getsockname()[0]
+    except Exception:
+        return guess_host_ip()
+    finally:
+        s.close()
+
+
+def sha256_file(path: str) -> Tuple[str, int]:
+    h = hashlib.sha256()
+    size = 0
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+            size += len(chunk)
+    return h.hexdigest(), size
+
+
+class OneFileHandler(BaseHTTPRequestHandler):
+    file_path: str = ""
+    url_path: str = "/fw.bin"
+
+    def do_GET(self):
+        if self.path.split("?", 1)[0] != self.url_path:
+            self.send_error(404, "Not Found")
+            return
+
+        try:
+            st = os.stat(self.file_path)
+            total = st.st_size
+
+            rng = self.headers.get("Range") or self.headers.get("range")
+            start, end = 0, total - 1
+            status = 200
+
+            if rng and rng.startswith("bytes="):
+                spec = rng[len("bytes="):].strip()
+                a, b = spec.split("-", 1)
+                if a:
+                    start = int(a)
+                if b:
+                    end = int(b)
+                if start < 0 or end < start or end >= total:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{total}")
+                    self.end_headers()
+                    return
+                status = 206
+
+            length = end - start + 1
+
+            self.send_response(status)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(length))
+            if status == 206:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
+            self.end_headers()
+
+            with open(self.file_path, "rb") as f:
+                f.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = f.read(min(64 * 1024, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+
+        except Exception as e:
+            self.send_error(500, f"Error: {e}")
+
+    def log_message(self, fmt, *args):
+        return
 
 
 @dataclass
-class TrainSectionState:
-    train_id: str
+class TempHttpServer:
+    host: str
+    port: int
+    file_path: str
+    url_path: str = "/fw.bin"
 
-    lego_id: str = ""
-    camera_id: str = ""
-    lego_addr: str = ""
-    camera_addr: str = ""
+    _srv: Optional[ThreadingHTTPServer] = None
+    _thr: Optional[threading.Thread] = None
 
-    lego_last_seen: float = 0.0
-    camera_last_seen: float = 0.0
-
-    power: int = 0
-    terminal_lines: list[str] = field(default_factory=list)
-    terminal_path: str = ""
-    terminal_offset: int = 0
-
-    @property
-    def lego_online(self) -> bool:
-        return self.lego_last_seen > 0 and (time.monotonic() - self.lego_last_seen) < MODULE_OFFLINE_TIMEOUT
-
-    @property
-    def camera_online(self) -> bool:
-        return self.camera_last_seen > 0 and (time.monotonic() - self.camera_last_seen) < MODULE_OFFLINE_TIMEOUT
-
-    @property
-    def removable(self) -> bool:
-        now = time.monotonic()
-        lego_dead = (self.lego_last_seen == 0.0) or ((now - self.lego_last_seen) >= SECTION_REMOVE_TIMEOUT)
-        cam_dead = (self.camera_last_seen == 0.0) or ((now - self.camera_last_seen) >= SECTION_REMOVE_TIMEOUT)
-        return lego_dead and cam_dead
-
-
-class BusWorker:
-    def __init__(self, inbox: queue.Queue):
-        self.inbox = inbox
-        self.loop = None
-        self.client = None
-        self.thread = None
-        self._ready = threading.Event()
-
-    def start(self):
-        self.thread = threading.Thread(target=self._thread_main, daemon=True)
-        self.thread.start()
-        self._ready.wait()
-
-    def _thread_main(self):
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
-        self.client = EventClient("train_gui")
-        self._ready.set()
-        self.loop.run_until_complete(self._main())
-
-    async def _main(self):
-        await self.client.connect()
-        while True:
-            evt = await self.client.next_event()
-            self.inbox.put(evt)
-
-    def emit(self, event_type: str, data: dict):
-        if not self.loop or not self.client:
-            return
-
-        fut = asyncio.run_coroutine_threadsafe(
-            self.client.emit(event_type, data),
-            self.loop,
+    def start(self) -> int:
+        handler_cls = type(
+            "OneFileHandlerBound",
+            (OneFileHandler,),
+            {"file_path": self.file_path, "url_path": self.url_path},
         )
+        self._srv = ThreadingHTTPServer((self.host, self.port), handler_cls)
+        actual_port = self._srv.server_address[1]
 
-        def _done(f):
+        def run():
             try:
-                f.result()
-            except Exception as e:
-                print(f"[train_gui] emit failed: {e}", flush=True)
+                self._srv.serve_forever()
+            except Exception:
+                pass
 
-        fut.add_done_callback(_done)
+        self._thr = threading.Thread(target=run, daemon=True)
+        self._thr.start()
+        return actual_port
+
+    def stop(self):
+        if self._srv:
+            try:
+                self._srv.shutdown()
+            except Exception:
+                pass
+            try:
+                self._srv.server_close()
+            except Exception:
+                pass
+        self._srv = None
+        self._thr = None
 
 
-class TrainSectionWidget:
-    def __init__(self, parent, send_cb):
-        self.send_cb = send_cb
-        self.state: TrainSectionState | None = None
+@dataclass
+class DeviceConn:
+    device_id: str
+    ws: WebSocketServerProtocol
+    last_seen: float = field(default_factory=time.time)
+    peer_ip: str = ""
 
-        self.frame = ttk.LabelFrame(parent, text="train")
-        self.frame.pack(fill="x", padx=8, pady=6)
 
-        status = ttk.Frame(self.frame)
-        status.pack(fill="x", padx=8, pady=(8, 4))
+class ConsoleServer:
+    def __init__(
+        self,
+        camera_id: str,
+        train_id: str = "",
+        out_path: Optional[str] = None,
+        host_ip_override: Optional[str] = None,
+    ):
+        self.camera_id = camera_id
+        self.train_id = train_id or ""
 
-        ttk.Label(status, text="LEGO:").grid(row=0, column=0, sticky="w")
-        self.lego_indicator = tk.Canvas(status, width=18, height=18, highlightthickness=0)
-        self.lego_indicator.grid(row=0, column=1, padx=(4, 8))
-        self.lego_dot = self.lego_indicator.create_oval(2, 2, 16, 16, fill="red", outline="black")
-        self.lego_var = tk.StringVar(value="offline")
-        ttk.Label(status, textvariable=self.lego_var, width=10).grid(row=0, column=2, sticky="w")
+        self.devices: Dict[str, DeviceConn] = {}
+        self.active_device: Optional[str] = None
 
-        ttk.Label(status, text="CAM:").grid(row=0, column=3, padx=(16, 0), sticky="w")
-        self.cam_indicator = tk.Canvas(status, width=18, height=18, highlightthickness=0)
-        self.cam_indicator.grid(row=0, column=4, padx=(4, 8))
-        self.cam_dot = self.cam_indicator.create_oval(2, 2, 16, 16, fill="red", outline="black")
-        self.cam_var = tk.StringVar(value="offline")
-        ttk.Label(status, textvariable=self.cam_var, width=10).grid(row=0, column=5, sticky="w")
+        self.cmd_seq = 0
+        self.pending_cmd: Dict[str, asyncio.Future] = {}
 
-        self.power_var = tk.StringVar(value="power: 0")
-        ttk.Label(status, textvariable=self.power_var).grid(row=0, column=6, padx=(20, 0), sticky="w")
+        self.out_fp = open(out_path, "a", buffering=1, encoding="utf-8") if out_path else None
+        self._shutdown = asyncio.Event()
+        self.host_ip_override = host_ip_override
 
-        info = ttk.Frame(self.frame)
-        info.pack(fill="x", padx=8, pady=(0, 4))
+        self.bus = EventClient(f"ws_console.{camera_id}")
 
-        self.lego_id_var = tk.StringVar(value="lego_id: -")
-        self.camera_id_var = tk.StringVar(value="camera_id: -")
+    def log(self, line: str) -> None:
+        ts = time.strftime("%H:%M:%S")
+        s = f"[{ts}] {line}"
+        print(s, flush=True)
+        if self.out_fp:
+            self.out_fp.write(s + "\n")
 
-        ttk.Label(info, textvariable=self.lego_id_var).pack(anchor="w")
-        ttk.Label(info, textvariable=self.camera_id_var).pack(anchor="w")
+    @staticmethod
+    def _compact(obj: Any) -> str:
+        try:
+            return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+        except Exception:
+            return str(obj)
 
-        controls = ttk.Frame(self.frame)
-        controls.pack(fill="x", padx=8, pady=(2, 6))
+    async def emit_bus(self, event_type: str, data: dict):
+        try:
+            await self.bus.emit(event_type, data)
+        except Exception as e:
+            self.log(f"bus emit failed: {e!r}")
 
-        self.btn_back = ttk.Button(
-            controls,
-            text="Backward -10%",
-            command=lambda: self._change_power(-POWER_STEP),
-            state="disabled",
-        )
-        self.btn_back.pack(side="left", padx=4)
+    def parse_path(self, path: str) -> Tuple[Optional[str], Optional[str]]:
+        parts = path.strip("/").split("/")
+        if len(parts) == 2 and parts[0] == "ws" and parts[1]:
+            return "ws", parts[1]
+        return None, None
 
-        self.btn_stop = ttk.Button(
-            controls,
-            text="Stop",
-            command=self._stop_train,
-            state="disabled",
-        )
-        self.btn_stop.pack(side="left", padx=4)
+    def next_cmd_id(self) -> str:
+        self.cmd_seq += 1
+        return str(self.cmd_seq)
 
-        self.btn_fwd = ttk.Button(
-            controls,
-            text="Forward +10%",
-            command=lambda: self._change_power(+POWER_STEP),
-            state="disabled",
-        )
-        self.btn_fwd.pack(side="left", padx=4)
-
-        term_wrap = ttk.Frame(self.frame)
-        term_wrap.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-
-        self.term_label = ttk.Label(term_wrap, text="Camera terminal")
-        self.term_label.pack(anchor="w")
-
-        self.term = tk.Text(term_wrap, height=10, wrap="word")
-        self.term.pack(fill="x", expand=True)
-        self.term.configure(state="disabled")
-
-        input_row = ttk.Frame(term_wrap)
-        input_row.pack(fill="x", pady=(4, 0))
-
-        self.cmd_var = tk.StringVar()
-        self.cmd_entry = ttk.Entry(input_row, textvariable=self.cmd_var, state="disabled")
-        self.cmd_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        self.cmd_entry.bind("<Return>", self._on_send_terminal)
-
-        self.cmd_btn = ttk.Button(input_row, text="Send", command=self._on_send_terminal, state="disabled")
-        self.cmd_btn.pack(side="left")
-
-    def destroy(self):
-        self.frame.destroy()
-
-    def _set_indicator(self, canvas: tk.Canvas, dot, online: bool, text_var: tk.StringVar):
-        canvas.itemconfig(dot, fill=("green" if online else "red"))
-        text_var.set("online" if online else "offline")
-
-    def _change_power(self, delta: int):
-        if not self.state or not self.state.train_id or not self.state.lego_online:
+    async def ws_handler(self, ws: WebSocketServerProtocol, path: str):
+        kind, device_id = self.parse_path(path)
+        if kind != "ws" or not device_id:
+            self.log(f"reject path={path!r} from {ws.remote_address}")
+            await ws.close(code=1008, reason="Bad path. Use /ws/<device_id>")
             return
 
-        self.state.power = clamp_power(self.state.power + delta)
-        self.power_var.set(f"power: {self.state.power}")
+        peer_ip = ""
+        try:
+            peer_ip = ws.remote_address[0] if ws.remote_address else ""
+        except Exception:
+            peer_ip = ""
 
-        self.send_cb(
-            "train_power",
+        self.devices[device_id] = DeviceConn(device_id=device_id, ws=ws, peer_ip=peer_ip)
+        if self.active_device is None:
+            self.active_device = device_id
+
+        self.log(
+            f"{device_id} connected from {ws.remote_address} "
+            f"peer_ip={peer_ip} active={self.active_device}"
+        )
+
+        await self.emit_bus(
+            "camera_ws_connected",
             {
-                "train_id": self.state.train_id,
-                "power": self.state.power,
+                "train_id": self.train_id,
+                "camera_id": self.camera_id,
+                "peer_ip": peer_ip,
+                "device_id": device_id,
             },
         )
 
-    def _stop_train(self):
-        if not self.state or not self.state.train_id or not self.state.lego_online:
+        try:
+            async for raw in ws:
+                self.devices[device_id].last_seen = time.time()
+                try:
+                    msg = json.loads(raw)
+                    if isinstance(msg, dict):
+                        await self.on_msg(device_id, msg)
+                    else:
+                        self.log(f"{device_id} (non-dict json) {self._compact(msg)}")
+                except Exception:
+                    self.log(f"{device_id} (text) {raw}")
+
+        except websockets.ConnectionClosed as e:
+            self.log(f"{device_id} disconnected ({e.code}: {e.reason})")
+
+        except Exception as e:
+            self.log(f"{device_id} handler error: {e!r}")
+
+        finally:
+            self.devices.pop(device_id, None)
+            if self.active_device == device_id:
+                self.active_device = next(iter(self.devices.keys()), None)
+                self.log(f"active device -> {self.active_device}")
+
+            await self.emit_bus(
+                "camera_ws_disconnected",
+                {
+                    "train_id": self.train_id,
+                    "camera_id": self.camera_id,
+                    "device_id": device_id,
+                },
+            )
+
+    async def on_msg(self, device_id: str, msg: Dict[str, Any]) -> None:
+        mtype = msg.get("type", "unknown")
+
+        if mtype == "hb":
+            self.log(f"{device_id} ♥ hb uptime_ms={msg.get('uptime_ms')} raw={self._compact(msg)}")
+            await self.emit_bus(
+                "camera_hb",
+                {
+                    "train_id": self.train_id,
+                    "camera_id": self.camera_id,
+                    "device_id": device_id,
+                    "uptime_ms": msg.get("uptime_ms"),
+                    "raw": msg,
+                },
+            )
             return
 
-        self.state.power = 0
-        self.power_var.set("power: 0")
-        self.send_cb("train_stop", {"train_id": self.state.train_id})
-
-    def _on_send_terminal(self, _event=None):
-        cmd = self.cmd_var.get().strip()
-        if not cmd or not self.state or not self.state.camera_online:
+        if mtype == "log":
+            self.log(f"{device_id} {msg.get('msg', '')}")
             return
 
+        if mtype == "ota_status":
+            self.log(f"{device_id} ⬆️ ota_status {self._compact(msg)}")
+            return
+
+        if mtype == "cmd_result":
+            cid = str(msg.get("id"))
+            ok = msg.get("ok")
+            if ok:
+                self.log(f"{device_id} ✅ cmd_result id={cid} result={msg.get('result')}")
+            else:
+                self.log(f"{device_id} ❌ cmd_result id={cid} error={msg.get('error')}")
+
+            fut = self.pending_cmd.pop(cid, None)
+            if fut and not fut.done():
+                fut.set_result(msg)
+            return
+
+        self.log(f"{device_id} {self._compact(msg)}")
+
+    async def send_to(self, device_id: str, payload: Dict[str, Any]) -> None:
+        if device_id not in self.devices:
+            self.log(f"Device not connected: {device_id}")
+            return
+
+        try:
+            await self.devices[device_id].ws.send(json.dumps(payload, ensure_ascii=False))
+        except Exception as e:
+            self.log(f"Send failed: {e!r}")
+
+    async def send_cmd_and_wait(
+        self,
+        device_id: str,
+        name: str,
+        args: Dict[str, Any],
+        timeout_s: int = 180,
+    ) -> Dict[str, Any]:
+        cid = self.next_cmd_id()
         payload = {
-            "train_id": self.state.train_id,
-            "command": cmd,
+            "type": "cmd",
+            "id": cid,
+            "name": name,
+            "args": args,
         }
-        if self.state.camera_id:
-            payload["camera_id"] = self.state.camera_id
 
-        self.send_cb("camera_terminal_input", payload)
-        self.append_terminal(f"> {cmd}")
-        self.cmd_var.set("")
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        self.pending_cmd[cid] = fut
 
-    def append_terminal(self, line: str):
-        self.term.configure(state="normal")
-        self.term.insert("end", line.rstrip() + "\n")
-        self.term.see("end")
-        self.term.configure(state="disabled")
-
-    def set_state(self, st: TrainSectionState):
-        self.state = st
-
-        self.frame.configure(text=st.train_id)
-        lego_info = st.lego_id or "-"
-        if st.lego_addr:
-            lego_info += f" ({st.lego_addr})"
-        self.lego_id_var.set(f"lego_id: {lego_info}")
-
-        cam_info = st.camera_id or "-"
-        if st.camera_addr:
-            cam_info += f" ({st.camera_addr})"
-        self.camera_id_var.set(f"camera_id: {cam_info}")
-
-        self.power_var.set(f"power: {st.power}")
-
-        self._set_indicator(self.lego_indicator, self.lego_dot, st.lego_online, self.lego_var)
-        self._set_indicator(self.cam_indicator, self.cam_dot, st.camera_online, self.cam_var)
-
-        lego_controls = "normal" if st.lego_online else "disabled"
-        self.btn_back.config(state=lego_controls)
-        self.btn_stop.config(state=lego_controls)
-        self.btn_fwd.config(state=lego_controls)
-
-        cam_controls = "normal" if st.camera_online else "disabled"
-        self.cmd_entry.config(state=cam_controls)
-        self.cmd_btn.config(state=cam_controls)
-
-        self.term_label.config(
-            text="Camera terminal" if st.camera_online else "Camera terminal (offline)"
-        )
-
-
-class TrainGuiApp:
-    def __init__(self, root: tk.Tk):
-        self.root = root
-        self.root.title("LEGO Train GUI")
-        self.root.geometry("1600x900")
-
-        self.inbox: queue.Queue = queue.Queue()
-        self.bus = BusWorker(self.inbox)
-
-        self.sections: dict[str, TrainSectionState] = {}
-        self.widgets: dict[str, TrainSectionWidget] = {}
-        self.ws_console_log_dir = os.path.join(os.path.dirname(__file__), "tmp")
-
-        self.main = ttk.Frame(root)
-        self.main.pack(fill="both", expand=True)
-
-        ttk.Label(
-            self.main,
-            text="LEGO Train Dashboard",
-            font=("Arial", 18, "bold"),
-        ).pack(anchor="w", padx=8, pady=(8, 4))
-
-        self.canvas = tk.Canvas(self.main, highlightthickness=0)
-        self.scroll = ttk.Scrollbar(self.main, orient="vertical", command=self.canvas.yview)
-        self.inner = ttk.Frame(self.canvas)
-
-        self.inner.bind(
-            "<Configure>",
-            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        )
-
-        self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
-        self.canvas.configure(yscrollcommand=self.scroll.set)
-
-        self.canvas.pack(side="left", fill="both", expand=True)
-        self.scroll.pack(side="right", fill="y")
-
-    def start(self):
-        self.bus.start()
-        self.root.after(100, self._poll_events)
-        self.root.after(1000, self._housekeeping)
-
-    def _default_terminal_path(self, camera_id: str) -> str:
-        safe = camera_id.replace("/", "_").replace("\\", "_").replace(" ", "_")
-        return os.path.join(self.ws_console_log_dir, f"ws_console_{safe}.log")
-
-    def _ensure_section(self, train_id: str) -> TrainSectionState:
-        if train_id not in self.sections:
-            self.sections[train_id] = TrainSectionState(train_id=train_id)
-
-        if train_id not in self.widgets:
-            self.widgets[train_id] = TrainSectionWidget(self.inner, self.bus.emit)
-
-        self._refresh_section(train_id)
-        return self.sections[train_id]
-
-    def _refresh_section(self, train_id: str):
-        if train_id in self.sections and train_id in self.widgets:
-            self.widgets[train_id].set_state(self.sections[train_id])
-
-    def _remove_section(self, train_id: str):
-        if train_id in self.widgets:
-            self.widgets[train_id].destroy()
-            del self.widgets[train_id]
-        if train_id in self.sections:
-            del self.sections[train_id]
-
-    def _touch_camera(self, train_id: str, camera_id: str = "", camera_addr: str = ""):
-        st = self._ensure_section(train_id)
-        if camera_id:
-            st.camera_id = camera_id
-        if camera_addr:
-            st.camera_addr = camera_addr
-        st.camera_last_seen = time.monotonic()
-
-        if st.camera_id and not st.terminal_path:
-            st.terminal_path = self._default_terminal_path(st.camera_id)
-
-        self._refresh_section(train_id)
-
-    def _touch_lego(self, train_id: str, lego_addr: str = ""):
-        st = self._ensure_section(train_id)
-        st.lego_id = train_id
-        if lego_addr:
-            st.lego_addr = lego_addr
-        st.lego_last_seen = time.monotonic()
-        self._refresh_section(train_id)
-
-    def _read_terminal_updates(self, train_id: str):
-        st = self.sections.get(train_id)
-        if not st or not st.terminal_path:
-            return
-        if not os.path.exists(st.terminal_path):
-            return
+        await self.send_to(device_id, payload)
 
         try:
-            with open(st.terminal_path, "r", encoding="utf-8", errors="replace") as f:
-                f.seek(st.terminal_offset)
-                chunk = f.read()
-                st.terminal_offset = f.tell()
-        except Exception:
+            res = await asyncio.wait_for(fut, timeout=timeout_s)
+            return res
+        except asyncio.TimeoutError:
+            self.pending_cmd.pop(cid, None)
+            raise
+
+    def print_help(self):
+        self.log("Commands:")
+        self.log(" devices - list connected devices")
+        self.log(" use <id> - switch active device")
+        self.log(" raw <id> {json} - send raw JSON to device")
+        self.log(" fota <id> <bin_path> - start temp HTTP, send fota cmd, wait result, stop HTTP")
+        self.log(" help - show this help")
+        self.log(" exit / quit - stop")
+
+    async def handle_command_line(self, line: str):
+        line = line.strip()
+        if not line:
             return
 
-        if not chunk:
+        cmd, *rest = line.split()
+        cmd = cmd.lower()
+
+        if cmd in ("quit", "exit"):
+            self._shutdown.set()
             return
 
-        lines = chunk.splitlines()
-        if not lines:
+        if cmd == "help":
+            self.print_help()
             return
 
-        for line in lines:
-            st.terminal_lines.append(line)
-            self.widgets[train_id].append_terminal(line)
+        if cmd == "devices":
+            if not self.devices:
+                self.log("No devices connected.")
+            else:
+                for did, dc in self.devices.items():
+                    age = time.time() - dc.last_seen
+                    mark = "*" if did == self.active_device else " "
+                    self.log(f"{mark} {did} peer_ip={dc.peer_ip} last_seen={age:.1f}s ago")
+            return
 
-    def handle_event(self, evt: dict):
-        etype = evt.get("type")
-        data = evt.get("data", {})
+        if cmd == "use":
+            if not rest:
+                self.log("Usage: use <device_id>")
+                return
+            did = rest[0]
+            if did not in self.devices:
+                self.log(f"Device not connected: {did}")
+                return
+            self.active_device = did
+            self.log(f"active device -> {did}")
+            return
 
-        if etype in ("lego_discovered", "lego_ready"):
-            train_id = data.get("train_id")
-            if train_id:
-                self._touch_lego(train_id, data.get("lego_addr", ""))
+        if cmd == "raw":
+            if len(rest) < 2:
+                self.log("Usage: raw <device_id> {json}")
+                return
+            did = rest[0]
+            raw_json = line.split(None, 2)[2]
+            try:
+                payload = json.loads(raw_json)
+                if not isinstance(payload, dict):
+                    self.log("raw JSON must be an object/dict")
+                    return
+            except Exception as e:
+                self.log(f"Bad JSON: {e}")
+                return
 
-        elif etype == "lego_disconnected":
-            train_id = data.get("train_id")
-            if train_id and train_id in self.sections:
-                self.sections[train_id].lego_last_seen = 0.0
-                self._refresh_section(train_id)
+            await self.send_to(did, payload)
+            return
 
-        elif etype == "train_bound":
-            train_id = data.get("train_id")
-            camera_id = data.get("camera_id", "")
-            camera_addr = data.get("camera_addr", "")
-            if train_id:
-                self._touch_camera(train_id, camera_id, camera_addr)
+        if cmd == "fota":
+            if len(rest) < 2:
+                self.log("Usage: fota <device_id> <bin_path>")
+                return
 
-        elif etype in ("camera_hb", "camera_ws_connected"):
-            train_id = data.get("train_id")
-            camera_id = data.get("camera_id", "")
-            if train_id:
-                self._touch_camera(train_id, camera_id)
+            did = rest[0]
+            bin_path = rest[1]
 
-        elif etype in ("camera_ws_disconnected", "camera_offline"):
-            train_id = data.get("train_id")
-            if train_id and train_id in self.sections:
-                self.sections[train_id].camera_last_seen = 0.0
-                self._refresh_section(train_id)
+            if did not in self.devices:
+                self.log(f"Device not connected: {did}")
+                return
 
-        elif etype == "train_state":
-            train_id = data.get("train_id")
-            if train_id:
-                st = self._ensure_section(train_id)
-                if "power" in data:
-                    st.power = clamp_power(int(data.get("power", st.power)))
-                st.lego_last_seen = time.monotonic()
-                self._refresh_section(train_id)
+            if not os.path.isfile(bin_path):
+                self.log(f"File not found: {bin_path}")
+                return
 
-    def _poll_events(self):
-        try:
-            while True:
-                evt = self.inbox.get_nowait()
-                self.handle_event(evt)
-        except queue.Empty:
-            pass
+            digest, size = sha256_file(bin_path)
 
-        self.root.after(100, self._poll_events)
+            peer_ip = self.devices[did].peer_ip
+            if self.host_ip_override:
+                host_ip = self.host_ip_override
+                why = "override"
+            else:
+                host_ip = local_ip_for_peer(peer_ip) if peer_ip else guess_host_ip()
+                why = f"route_to_peer({peer_ip})" if peer_ip else "fallback_guess"
 
-    def _housekeeping(self):
-        for train_id in list(self.sections.keys()):
-            st = self.sections.get(train_id)
-            if not st:
+            http = TempHttpServer(host="0.0.0.0", port=0, file_path=bin_path, url_path="/fw.bin")
+            port = http.start()
+            url = f"http://{host_ip}:{port}/fw.bin"
+
+            self.log(f"FOTA using host_ip={host_ip} ({why}), peer_ip={peer_ip}")
+            self.log(f"FOTA HTTP UP: {url}")
+            self.log(f"  sha256={digest}")
+            self.log(f"  size={size} bytes")
+
+            try:
+                args = {
+                    "url": url,
+                    "sha256": digest,
+                    "size": size,
+                }
+                res = await self.send_cmd_and_wait(did, "fota", args, timeout_s=900)
+                ok = bool(res.get("ok"))
+                if ok:
+                    self.log(f"FOTA OK for {did}")
+                else:
+                    self.log(f"FOTA FAIL for {did}: {res.get('error')}")
+            except asyncio.TimeoutError:
+                self.log("FOTA timeout waiting cmd_result")
+            finally:
+                http.stop()
+                self.log("FOTA HTTP DOWN")
+            return
+
+        self.log("Unknown command. Type 'help'.")
+
+    async def console_loop(self):
+        self.print_help()
+        loop = asyncio.get_running_loop()
+
+        while not self._shutdown.is_set():
+            try:
+                line = await loop.run_in_executor(None, sys.stdin.readline)
+            except (EOFError, KeyboardInterrupt):
+                self._shutdown.set()
+                break
+
+            if not line:
+                self._shutdown.set()
+                break
+
+            await self.handle_command_line(line)
+
+    async def bus_loop(self):
+        while not self._shutdown.is_set():
+            evt = await self.bus.next_event()
+            etype = evt.get("type")
+            data = evt.get("data", {})
+
+            if etype == "train_bound":
+                evt_train_id = data.get("train_id", "")
+                evt_camera_id = data.get("camera_id", "")
+                if evt_camera_id == self.camera_id and evt_train_id:
+                    if self.train_id != evt_train_id:
+                        self.train_id = evt_train_id
+                        self.log(f"[bus] bound to train_id={self.train_id}")
                 continue
 
-            self._read_terminal_updates(train_id)
-            self._refresh_section(train_id)
+            if etype != "camera_terminal_input":
+                continue
 
-            if st.removable:
-                self._remove_section(train_id)
+            evt_train_id = data.get("train_id", "")
+            evt_camera_id = data.get("camera_id", "")
+            command = (data.get("command") or "").strip()
 
-        self.root.after(1000, self._housekeeping)
+            if not command:
+                continue
+
+            if evt_camera_id and evt_camera_id != self.camera_id:
+                continue
+
+            if evt_train_id and self.train_id and evt_train_id != self.train_id:
+                continue
+
+            target_device = None
+            if self.active_device:
+                target_device = self.active_device
+            elif len(self.devices) == 1:
+                target_device = next(iter(self.devices.keys()), None)
+
+            if not target_device:
+                self.log(f"bus command ignored: no connected target for command={command!r}")
+                continue
+
+            self.log(f"[bus] {target_device} <= {command}")
+            await self.handle_command_line(command)
+
+    async def run(self, host: str, port: int):
+        await self.bus.connect()
+
+        self.log(f"WS server listening on ws://{host}:{port}/ws/")
+        self.log(f"camera_id={self.camera_id} train_id={self.train_id or '-'}")
+        if self.host_ip_override:
+            self.log(f"Host IP override: {self.host_ip_override}")
+
+        async with serve(
+            self.ws_handler,
+            host,
+            port,
+            ping_interval=None,
+            compression=None,
+            max_size=2 * 1024 * 1024,
+        ):
+            console_task = asyncio.create_task(self.console_loop())
+            bus_task = asyncio.create_task(self.bus_loop())
+
+            done, pending = await asyncio.wait(
+                [console_task, bus_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            for t in pending:
+                t.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+            for t in done:
+                exc = t.exception()
+                if exc:
+                    raise exc
+
+        self.log("bye")
+        await self.bus.close()
+
+        if self.out_fp:
+            self.out_fp.close()
 
 
 def main():
-    root = tk.Tk()
-    app = TrainGuiApp(root)
-    app.start()
-    root.mainloop()
+    ap = argparse.ArgumentParser(description="WS console + FOTA + event_bus bridge")
+    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--camera-id", required=True)
+    ap.add_argument("--train-id", default="")
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--host-ip", default=None)
+    args = ap.parse_args()
+
+    srv = ConsoleServer(
+        camera_id=args.camera_id,
+        train_id=args.train_id,
+        out_path=args.out,
+        host_ip_override=args.host_ip,
+    )
+
+    try:
+        asyncio.run(srv.run(args.host, args.port))
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

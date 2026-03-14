@@ -173,7 +173,7 @@ class TrainSectionWidget:
         self.term_label = ttk.Label(term_wrap, text="Camera terminal")
         self.term_label.pack(anchor="w")
 
-        self.term = tk.Text(term_wrap, height=10, wrap="word")
+        self.term = tk.Text(term_wrap, height=10, width=120, wrap="word")
         self.term.pack(fill="x", expand=True)
         self.term.configure(state="disabled")
 
@@ -198,22 +198,29 @@ class TrainSectionWidget:
     def _change_power(self, delta: int):
         if not self.state or not self.state.train_id or not self.state.lego_online:
             return
+
         self.state.power = clamp_power(self.state.power + delta)
         self.power_var.set(f"power: {self.state.power}")
-        self.send_cb("train_power", {"train_id": self.state.train_id, "power": self.state.power})
+
+        self.send_cb(
+            "train_power",
+            {
+                "train_id": self.state.train_id,
+                "power": self.state.power,
+            },
+        )
 
     def _stop_train(self):
         if not self.state or not self.state.train_id or not self.state.lego_online:
             return
+
         self.state.power = 0
         self.power_var.set("power: 0")
         self.send_cb("train_stop", {"train_id": self.state.train_id})
 
     def _on_send_terminal(self, _event=None):
-        if not self.state or not self.state.camera_online:
-            return
         cmd = self.cmd_var.get().strip()
-        if not cmd:
+        if not cmd or not self.state or not self.state.camera_online:
             return
 
         payload = {"command": cmd}
@@ -366,6 +373,27 @@ class TrainGuiApp:
     def _merge_section_into_train(self, train_id: str, camera_id: str = "", camera_addr: str = "") -> TrainSectionState:
         train_section_id = self.train_to_section.get(train_id)
         cam_section_id = self.camera_to_section.get(camera_id) if camera_id else None
+
+        # Если обе секции уже существуют и это разные секции — сливаем camera-only в train
+        if train_section_id and cam_section_id and train_section_id in self.sections and cam_section_id in self.sections and train_section_id != cam_section_id:
+            train_st = self.sections[train_section_id]
+            cam_st = self.sections[cam_section_id]
+
+            train_st.camera_id = camera_id or train_st.camera_id or cam_st.camera_id
+            train_st.camera_addr = camera_addr or train_st.camera_addr or cam_st.camera_addr
+            train_st.camera_last_seen = max(train_st.camera_last_seen, cam_st.camera_last_seen)
+
+            if cam_st.terminal_path and not train_st.terminal_path:
+                train_st.terminal_path = cam_st.terminal_path
+            if cam_st.terminal_offset and train_st.terminal_offset == 0:
+                train_st.terminal_offset = cam_st.terminal_offset
+            if cam_st.terminal_lines:
+                train_st.terminal_lines.extend(cam_st.terminal_lines)
+
+            self.camera_to_section[camera_id] = train_section_id
+            self._remove_section(cam_section_id)
+            self._refresh_section(train_section_id)
+            return train_st
 
         if train_section_id and train_section_id in self.sections:
             st = self.sections[train_section_id]
