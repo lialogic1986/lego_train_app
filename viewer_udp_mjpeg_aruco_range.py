@@ -2,6 +2,7 @@ import argparse
 import socket
 import struct
 import time
+from dataclasses import dataclass
 
 import numpy as np
 import cv2
@@ -11,8 +12,8 @@ from host_config import load_config, save_config, get_path, set_path
 
 HDR_FMT = "!2sHHHHH"
 HDR_SIZE = struct.calcsize(HDR_FMT)
-
-FRAME_TIMEOUT_S = 1.2
+FRAME_ID_MOD = 1 << 16
+DEFAULT_FRAME_TIMEOUT_S = 0.10
 
 
 DEFAULTS = {
@@ -31,41 +32,108 @@ DEFAULTS = {
 }
 
 
+
+def now_s() -> float:
+    return time.monotonic()
+
+
+
+def is_newer_frame_id(new_fid: int, cur_fid: int) -> bool:
+    """Compare 16-bit frame IDs with wraparound awareness."""
+    diff = (new_fid - cur_fid) & (FRAME_ID_MOD - 1)
+    return 0 < diff < (FRAME_ID_MOD // 2)
+
+
+@dataclass
+class AssemblerStats:
+    completed: int = 0
+    dropped_timeout: int = 0
+    dropped_replaced: int = 0
+    dropped_old: int = 0
+    dropped_bad_hdr: int = 0
+    dropped_incomplete_join: int = 0
+
+
 class FrameAssembler:
-    def __init__(self):
-        self.fid = None
-        self.total = 0
-        self.parts = {}
-        self.last_ts = 0.0
+    """
+    Low-latency assembler for a single in-flight MJPEG frame.
+
+    Policy:
+    - keep only one currently assembling frame;
+    - if a newer frame arrives, drop the old incomplete one immediately;
+    - ignore older/out-of-order frames;
+    - drop incomplete frame if it lives longer than timeout from the first chunk.
+    """
+
+    def __init__(self, frame_timeout_s: float = DEFAULT_FRAME_TIMEOUT_S):
+        self.frame_timeout_s = frame_timeout_s
+        self.stats = AssemblerStats()
+        self.reset()
 
     def reset(self):
         self.fid = None
         self.total = 0
         self.parts = {}
+        self.first_ts = 0.0
         self.last_ts = 0.0
 
-    def add(self, fid, cid, total, payload):
-        now = time.time()
-        if self.fid is not None and (now - self.last_ts) > FRAME_TIMEOUT_S:
-            self.reset()
+    def _drop_current(self, reason: str):
+        if self.fid is not None and len(self.parts) < self.total:
+            if reason == "timeout":
+                self.stats.dropped_timeout += 1
+            elif reason == "replaced":
+                self.stats.dropped_replaced += 1
+        self.reset()
 
-        if self.fid != fid or self.total != total:
-            self.fid = fid
-            self.total = total
-            self.parts = {}
+    def _start_new(self, fid: int, total: int, ts: float):
+        self.fid = fid
+        self.total = total
+        self.parts = {}
+        self.first_ts = ts
+        self.last_ts = ts
+
+    def add(self, fid: int, cid: int, total: int, payload: bytes):
+        ts = now_s()
+
+        if total <= 0 or cid >= total:
+            self.stats.dropped_bad_hdr += 1
+            return None
+
+        if self.fid is not None and (ts - self.first_ts) > self.frame_timeout_s:
+            self._drop_current("timeout")
+
+        if self.fid is None:
+            self._start_new(fid, total, ts)
+        elif fid != self.fid:
+            if is_newer_frame_id(fid, self.fid):
+                self._drop_current("replaced")
+                self._start_new(fid, total, ts)
+            else:
+                self.stats.dropped_old += 1
+                return None
+        elif total != self.total:
+            # Same frame id but inconsistent total: restart this frame cleanly.
+            self.stats.dropped_bad_hdr += 1
+            self._drop_current("replaced")
+            self._start_new(fid, total, ts)
 
         self.parts[cid] = payload
-        self.last_ts = now
+        self.last_ts = ts
 
-        if len(self.parts) == self.total:
-            try:
-                jpeg = b"".join(self.parts[i] for i in range(self.total))
-            except KeyError:
-                self.reset()
-                return None
+        if len(self.parts) != self.total:
+            return None
+
+        try:
+            jpeg = b"".join(self.parts[i] for i in range(self.total))
+        except KeyError:
+            self.stats.dropped_incomplete_join += 1
             self.reset()
-            return jpeg
-        return None
+            return None
+
+        self.stats.completed += 1
+        self.reset()
+        return jpeg
+
 
 
 def make_aruco_detector(dict_name: str):
@@ -95,9 +163,11 @@ def make_aruco_detector(dict_name: str):
     return cv2.aruco.ArucoDetector(aruco_dict, params)
 
 
+
 def quad_area_px(corners_4x2) -> float:
     c = corners_4x2.reshape(4, 2).astype(np.float32)
     return float(cv2.contourArea(c))
+
 
 
 def dist_from_area(area_px: float, k_area: float) -> float:
@@ -106,16 +176,19 @@ def dist_from_area(area_px: float, k_area: float) -> float:
     return k_area / (area_px ** 0.5)
 
 
+
 def ema(prev: float | None, x: float, alpha: float) -> float:
     if prev is None or not np.isfinite(prev):
         return x
     return (1.0 - alpha) * prev + alpha * x
 
 
+
 def put(img, text, x, y, s=0.45):
     cv2.putText(img, text, (x, y),
                 cv2.FONT_HERSHEY_SIMPLEX, s,
                 (255, 255, 255), 1, cv2.LINE_AA)
+
 
 
 def main():
@@ -132,6 +205,8 @@ def main():
     ap.add_argument("--calib-dist", type=float, default=None)
     ap.add_argument("--ema", type=float, default=None)
     ap.add_argument("--cooldown", type=float, default=None)
+    ap.add_argument("--frame-timeout-ms", type=float, default=DEFAULT_FRAME_TIMEOUT_S * 1000.0,
+                    help="Drop incomplete frame after this many ms from the first chunk")
 
     ap.add_argument("--th-approach", type=float, default=None)
     ap.add_argument("--th-brake", type=float, default=None)
@@ -165,9 +240,10 @@ def main():
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((listen_ip, port))
-    sock.settimeout(0.2)
+    sock.settimeout(0.02)
 
-    asm = FrameAssembler()
+    frame_timeout_s = max(0.01, args.frame_timeout_ms / 1000.0)
+    asm = FrameAssembler(frame_timeout_s=frame_timeout_s)
 
     cv2.namedWindow(args.window, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(args.window, 640, 480)
@@ -175,7 +251,7 @@ def main():
     # stats
     frames = 0
     fps_print = 0
-    last_stat = time.time()
+    last_stat = now_s()
 
     # load persisted coefficient
     k_area = float(get_path(cfg, "range.k_area", 0.0))
@@ -194,6 +270,7 @@ def main():
     print(f"[aruco] dict={dict_name}")
     print(f"[range] k_area={k_area:.4f} calib_dist={calib_dist:.2f} ema={ema_alpha} cooldown={cooldown_s}")
     print(f"[th] approach<{th_approach:.2f} brake<{th_brake:.2f} stop<{th_stop:.2f}")
+    print(f"[video] frame_timeout={frame_timeout_s * 1000.0:.0f} ms (single in-flight frame, drop old on newer frame)")
 
     while True:
         try:
@@ -217,9 +294,9 @@ def main():
 
                     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-                    t0 = time.time()
+                    t0 = now_s()
                     corners, ids, rejected = detector.detectMarkers(gray)
-                    last_det_ms = (time.time() - t0) * 1000.0
+                    last_det_ms = (now_s() - t0) * 1000.0
                     last_rej_n = 0 if rejected is None else len(rejected)
 
                     best = None  # (area_px, id, corners4)
@@ -244,7 +321,7 @@ def main():
                         if np.isfinite(dist_raw):
                             dist_f = ema(dist_f, dist_raw, ema_alpha)
 
-                        now = time.time()
+                        now = now_s()
                         if dist_f is not None and np.isfinite(dist_f):
                             if dist_f < th_stop and (now - last_event_ts["STOP"]) >= cooldown_s:
                                 last_event_ts["STOP"] = now
@@ -258,7 +335,7 @@ def main():
 
                     # FPS
                     frames += 1
-                    now = time.time()
+                    now = now_s()
                     if now - last_stat >= 1.0:
                         fps_print = frames
                         frames = 0
@@ -268,7 +345,7 @@ def main():
                     det_n = 0 if ids is None else len(ids)
                     put(img, f"FPS {fps_print} det {det_n} rej {last_rej_n} {last_det_ms:.1f}ms", 5, 16, 0.45)
                     put(img, f"Click window; press C to calib @ {calib_dist:.2f}m", 5, 34, 0.45)
-                    put(img, f"k_area {k_area:.3f}  dict {dict_name}", 5, 52, 0.45)
+                    put(img, f"k_area {k_area:.3f} dict {dict_name}", 5, 52, 0.45)
 
                     if last_best_id is None:
                         put(img, "Best: -", 5, 70, 0.50)
@@ -278,7 +355,9 @@ def main():
                         put(img, f"Best ID {last_best_id} area {last_best_area:.0f}px", 5, 70, 0.50)
                         put(img, f"dist raw {dr} filt {df}", 5, 88, 0.50)
 
-                    put(img, f"TH <{th_approach:.2f}/{th_brake:.2f}/{th_stop:.2f}m  ESC/q exit", 5, 106, 0.42)
+                    s = asm.stats
+                    put(img, f"drop t/o {s.dropped_timeout} repl {s.dropped_replaced} old {s.dropped_old}", 5, 106, 0.42)
+                    put(img, f"TH <{th_approach:.2f}/{th_brake:.2f}/{th_stop:.2f}m ESC/q exit", 5, 124, 0.42)
 
                     cv2.imshow(args.window, img)
 
