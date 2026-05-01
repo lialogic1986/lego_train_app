@@ -182,6 +182,7 @@ class ConsoleServer:
 
         self.out_fp = open(out_path, "a", buffering=1, encoding="utf-8") if out_path else None
         self._shutdown = asyncio.Event()
+        self._bus_command_tasks: set[asyncio.Task] = set()
         self.host_ip_override = host_ip_override
 
         self.bus = EventClient(f"ws_console.{camera_id}")
@@ -539,7 +540,19 @@ class ConsoleServer:
                 continue
 
             self.log(f"[bus] {target_device} <= {command}")
-            await self.handle_command_line(command)
+            task = asyncio.create_task(self.handle_command_line(command))
+            self._bus_command_tasks.add(task)
+
+            def _forget_done(done_task):
+                self._bus_command_tasks.discard(done_task)
+                try:
+                    exc = done_task.exception()
+                except asyncio.CancelledError:
+                    return
+                if exc:
+                    self.log(f"bus command task failed: {exc!r}")
+
+            task.add_done_callback(_forget_done)
 
     async def run(self, host: str, port: int):
         await self.bus.connect()
@@ -568,6 +581,11 @@ class ConsoleServer:
             for t in pending:
                 t.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
+
+            for t in list(self._bus_command_tasks):
+                t.cancel()
+            await asyncio.gather(*self._bus_command_tasks, return_exceptions=True)
+            self._bus_command_tasks.clear()
 
             for t in done:
                 exc = t.exception()

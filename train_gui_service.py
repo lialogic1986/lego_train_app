@@ -6,7 +6,7 @@ import threading
 import time
 import tkinter as tk
 from dataclasses import dataclass, field
-from tkinter import ttk
+from tkinter import filedialog, ttk
 
 import cv2
 
@@ -15,6 +15,10 @@ from event_client import EventClient
 
 MODULE_OFFLINE_TIMEOUT = 10.0
 SECTION_REMOVE_TIMEOUT = 30.0
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_FOTA_BIN_PATH = os.path.abspath(
+    os.path.join(PROJECT_ROOT, "..", "lego_esp32cam", "build", "lego_esp32cam.bin")
+)
 POWER_STEP = 20
 POWER_MIN = -100
 POWER_MAX = 100
@@ -45,6 +49,7 @@ class TrainSectionState:
     section_id: str
     train_id: str = ""
     camera_id: str = ""
+    camera_device_id: str = ""
     lego_id: str = ""
     camera_addr: str = ""
     lego_addr: str = ""
@@ -155,10 +160,12 @@ class TrainSectionWidget:
         self.train_id_var = tk.StringVar(value="train_id: -")
         self.lego_id_var = tk.StringVar(value="lego_id: -")
         self.camera_id_var = tk.StringVar(value="camera_id: -")
+        self.camera_device_var = tk.StringVar(value="device_id: -")
 
         ttk.Label(info, textvariable=self.train_id_var).pack(anchor="w")
         ttk.Label(info, textvariable=self.lego_id_var).pack(anchor="w")
         ttk.Label(info, textvariable=self.camera_id_var).pack(anchor="w")
+        ttk.Label(info, textvariable=self.camera_device_var).pack(anchor="w")
 
         video_wrap = ttk.Frame(self.frame)
         video_wrap.pack(fill="x", padx=8, pady=(2, 6))
@@ -208,6 +215,14 @@ class TrainSectionWidget:
             state="disabled",
         )
         self.btn_fwd.pack(side="left", padx=4)
+
+        self.btn_fota = ttk.Button(
+            controls,
+            text="FOTA...",
+            command=self._on_fota,
+            state="disabled",
+        )
+        self.btn_fota.pack(side="left", padx=(18, 4))
 
         term_wrap = ttk.Frame(self.frame)
         term_wrap.pack(fill="both", expand=True, padx=8, pady=(0, 8))
@@ -275,6 +290,49 @@ class TrainSectionWidget:
         self.append_terminal(f"> {cmd}")
         self.cmd_var.set("")
 
+    def _send_terminal_command(self, cmd: str, include_train_id: bool = True):
+        if not self.state or not self.state.camera_online:
+            return
+
+        payload = {"command": cmd}
+        if self.state.camera_id:
+            payload["camera_id"] = self.state.camera_id
+        if include_train_id and self.state.train_id:
+            payload["train_id"] = self.state.train_id
+
+        self.send_cb("camera_terminal_input", payload)
+        self.append_terminal(f"> {cmd}")
+
+    def _on_fota(self):
+        if not self.state or not self.state.camera_online:
+            return
+
+        device_id = self.state.camera_device_id.strip()
+        if not device_id:
+            self.append_terminal("FOTA: no connected camera device_id yet")
+            return
+
+        initial_path = DEFAULT_FOTA_BIN_PATH
+        initial_dir = os.path.dirname(initial_path) if os.path.isdir(os.path.dirname(initial_path)) else PROJECT_ROOT
+        initial_file = os.path.basename(initial_path) if os.path.isfile(initial_path) else ""
+
+        bin_path = filedialog.askopenfilename(
+            parent=self.frame,
+            title="Select firmware image",
+            initialdir=initial_dir,
+            initialfile=initial_file,
+            filetypes=(("Firmware images", "*.bin"), ("All files", "*")),
+        )
+        if not bin_path:
+            return
+
+        bin_path = os.path.abspath(bin_path)
+        if " " in bin_path:
+            self.append_terminal(f"FOTA: path contains spaces: {bin_path}")
+            return
+
+        self._send_terminal_command(f"fota {device_id} {bin_path}", include_train_id=False)
+
     def append_terminal(self, line: str):
         self.term.configure(state="normal")
         self.term.insert("end", line.rstrip() + "\n")
@@ -316,6 +374,7 @@ class TrainSectionWidget:
         if st.camera_addr:
             cam_info += f" ({st.camera_addr})"
         self.camera_id_var.set(f"camera_id: {cam_info}")
+        self.camera_device_var.set(f"device_id: {st.camera_device_id or '-'}")
 
         self.power_var.set(f"power: {st.power}")
 
@@ -330,6 +389,8 @@ class TrainSectionWidget:
         cam_controls = "normal" if st.camera_online else "disabled"
         self.cmd_entry.config(state=cam_controls)
         self.cmd_btn.config(state=cam_controls)
+        fota_controls = "normal" if (st.camera_online and st.camera_device_id) else "disabled"
+        self.btn_fota.config(state=fota_controls)
 
         self.term_label.config(
             text="Camera terminal" if st.camera_online else "Camera terminal (offline)"
@@ -345,7 +406,9 @@ class TrainGuiApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("LEGO Train GUI")
+        self._closing = False
         self._set_initial_window_size()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.inbox: queue.Queue = queue.Queue()
         self.bus = BusWorker(self.inbox)
@@ -382,6 +445,20 @@ class TrainGuiApp:
 
         self.canvas.pack(side="left", fill="both", expand=True)
         self.scroll.pack(side="right", fill="y")
+
+    def _on_close(self):
+        if self._closing:
+            return
+
+        self._closing = True
+        self.bus.emit(
+            "app_shutdown",
+            {
+                "source": "train_gui",
+                "reason": "window_close",
+            },
+        )
+        self.root.after(300, self.root.destroy)
 
     def _set_initial_window_size(self):
         screen_w = self.root.winfo_screenwidth()
@@ -452,7 +529,13 @@ class TrainGuiApp:
             del self.widgets[section_id]
         del self.sections[section_id]
 
-    def _merge_section_into_train(self, train_id: str, camera_id: str = "", camera_addr: str = "") -> TrainSectionState:
+    def _merge_section_into_train(
+        self,
+        train_id: str,
+        camera_id: str = "",
+        camera_addr: str = "",
+        camera_device_id: str = "",
+    ) -> TrainSectionState:
         train_section_id = self.train_to_section.get(train_id)
         cam_section_id = self.camera_to_section.get(camera_id) if camera_id else None
 
@@ -463,6 +546,7 @@ class TrainGuiApp:
 
             train_st.camera_id = camera_id or train_st.camera_id or cam_st.camera_id
             train_st.camera_addr = camera_addr or train_st.camera_addr or cam_st.camera_addr
+            train_st.camera_device_id = camera_device_id or train_st.camera_device_id or cam_st.camera_device_id
             train_st.camera_last_seen = max(train_st.camera_last_seen, cam_st.camera_last_seen)
 
             if cam_st.terminal_path and not train_st.terminal_path:
@@ -512,16 +596,20 @@ class TrainGuiApp:
                 st.video_path = self._default_video_path(camera_id)
         if camera_addr:
             st.camera_addr = camera_addr
+        if camera_device_id:
+            st.camera_device_id = camera_device_id
 
         self.train_to_section[train_id] = train_id
         self._refresh_section(train_id)
         return st
 
-    def _touch_camera_only(self, camera_id: str, camera_addr: str = ""):
+    def _touch_camera_only(self, camera_id: str, camera_addr: str = "", camera_device_id: str = ""):
         st = self._ensure_section_by_camera(camera_id)
         st.camera_id = camera_id
         if camera_addr:
             st.camera_addr = camera_addr
+        if camera_device_id:
+            st.camera_device_id = camera_device_id
         if not st.terminal_path:
             st.terminal_path = self._default_terminal_path(camera_id)
         if not st.video_path:
@@ -529,8 +617,14 @@ class TrainGuiApp:
         st.camera_last_seen = time.monotonic()
         self._refresh_section(st.section_id)
 
-    def _touch_camera_bound(self, train_id: str, camera_id: str, camera_addr: str = ""):
-        st = self._merge_section_into_train(train_id, camera_id, camera_addr)
+    def _touch_camera_bound(
+        self,
+        train_id: str,
+        camera_id: str,
+        camera_addr: str = "",
+        camera_device_id: str = "",
+    ):
+        st = self._merge_section_into_train(train_id, camera_id, camera_addr, camera_device_id)
         st.camera_last_seen = time.monotonic()
         self._refresh_section(train_id)
 
@@ -636,11 +730,12 @@ class TrainGuiApp:
         elif etype in ("camera_hb", "camera_ws_connected"):
             camera_id = data.get("camera_id")
             train_id = data.get("train_id", "")
+            device_id = data.get("device_id", "")
             if camera_id:
                 if train_id:
-                    self._touch_camera_bound(train_id, camera_id)
+                    self._touch_camera_bound(train_id, camera_id, camera_device_id=device_id)
                 else:
-                    self._touch_camera_only(camera_id)
+                    self._touch_camera_only(camera_id, camera_device_id=device_id)
 
         elif etype in ("camera_ws_disconnected", "camera_offline"):
             train_id = data.get("train_id", "")
@@ -653,6 +748,8 @@ class TrainGuiApp:
 
             if section_id and section_id in self.sections:
                 self.sections[section_id].camera_last_seen = 0.0
+                if data.get("device_id") == self.sections[section_id].camera_device_id:
+                    self.sections[section_id].camera_device_id = ""
                 self._refresh_section(section_id)
 
         elif etype in ("lego_discovered", "lego_ready"):

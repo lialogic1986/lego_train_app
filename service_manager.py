@@ -2,7 +2,9 @@
 
 import asyncio
 import json
+import os
 import signal
+import socket
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -14,6 +16,9 @@ from event_client import EventClient
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 PYTHON = sys.executable
+EVENT_BUS_HOST = "127.0.0.1"
+EVENT_BUS_PORT = 8765
+MANAGER_LOCK_PATH = PROJECT_ROOT / "tmp" / "service_manager.lock"
 
 
 @dataclass
@@ -29,6 +34,64 @@ class CameraInstance:
     ws_console_out: str = ""
 
 
+class ProcessLock:
+    def __init__(self, path: Path):
+        self.path = path
+        self.fp = None
+
+    def acquire(self) -> bool:
+        self.path.parent.mkdir(exist_ok=True)
+        self.fp = open(self.path, "a+", encoding="utf-8")
+        self.fp.seek(0)
+
+        if os.name == "nt":
+            import msvcrt
+
+            try:
+                msvcrt.locking(self.fp.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                self.fp.close()
+                self.fp = None
+                return False
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(self.fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                self.fp.close()
+                self.fp = None
+                return False
+
+        self.fp.seek(0)
+        self.fp.truncate()
+        self.fp.write(str(os.getpid()))
+        self.fp.flush()
+        return True
+
+    def release(self):
+        if not self.fp:
+            return
+
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                self.fp.seek(0)
+                msvcrt.locking(self.fp.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self.fp.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+
+        try:
+            self.fp.close()
+        finally:
+            self.fp = None
+
+
 def safe_filename_id(value: str) -> str:
     safe = []
     for ch in value:
@@ -37,6 +100,25 @@ def safe_filename_id(value: str) -> str:
         else:
             safe.append("_")
     return "".join(safe) or "camera"
+
+
+def is_tcp_port_open(host: str, port: int, timeout_s: float = 0.2) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout_s):
+            return True
+    except OSError:
+        return False
+
+
+def is_udp_port_available(host: str, port: int) -> bool:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.bind((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
 
 
 class PortAllocator:
@@ -66,6 +148,8 @@ class ServiceManager:
 
         self.processes: Dict[str, subprocess.Popen] = {}
         self.camera_instances: Dict[str, CameraInstance] = {}
+        self.lock: Optional[ProcessLock] = None
+        self.stop_event: Optional[asyncio.Event] = None
 
         cfg_path = self.root / "service_manager_config.json"
         with open(cfg_path, "r", encoding="utf-8") as f:
@@ -83,6 +167,13 @@ class ServiceManager:
         return p
 
     def start_event_bus(self):
+        if is_tcp_port_open(EVENT_BUS_HOST, EVENT_BUS_PORT):
+            print(
+                f"[manager] event_bus already running on ws://{EVENT_BUS_HOST}:{EVENT_BUS_PORT}",
+                flush=True,
+            )
+            return None
+
         return self.start_process(
             "event_bus",
             [self.python, str((self.root / "event_bus.py").resolve())]
@@ -131,8 +222,17 @@ class ServiceManager:
             "--out", str(ws_log),
         ]
 
-        viewer_proc = self.start_process(viewer_name, viewer_cmd)
-        ws_proc = self.start_process(ws_name, ws_cmd)
+        viewer_proc = None
+        if is_udp_port_available("0.0.0.0", video_port):
+            viewer_proc = self.start_process(viewer_name, viewer_cmd)
+        else:
+            print(f"[manager] viewer port {video_port}/udp already in use; reusing existing listener", flush=True)
+
+        ws_proc = None
+        if is_tcp_port_open("127.0.0.1", ws_port):
+            print(f"[manager] ws_console port {ws_port}/tcp already in use; reusing existing listener", flush=True)
+        else:
+            ws_proc = self.start_process(ws_name, ws_cmd)
 
         inst = CameraInstance(
             camera_id=camera_id,
@@ -152,6 +252,13 @@ class ServiceManager:
         etype = evt.get("type")
         data = evt.get("data", {})
         request_id = evt.get("request_id", "")
+
+        if etype == "app_shutdown":
+            source = data.get("source") or "event"
+            print(f"[manager] shutdown requested by {source}", flush=True)
+            if self.stop_event:
+                self.stop_event.set()
+            return
 
         if etype in ("camera_discovered", "camera_reboot_detected"):
             camera_id = data.get("camera_id")
@@ -188,12 +295,31 @@ class ServiceManager:
                 print(f"[manager] lego ready: {train_id}", flush=True)
             return
 
-    async def run(self):
+    async def run(self, stop_ev: asyncio.Event):
+        self.stop_event = stop_ev
         await self.bus.connect()
         self.start_common_services()
 
-        while True:
-            evt = await self.bus.next_event()
+        while not stop_ev.is_set():
+            event_task = asyncio.create_task(self.bus.next_event())
+            stop_task = asyncio.create_task(stop_ev.wait())
+
+            done, pending = await asyncio.wait(
+                {event_task, stop_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+            if stop_task in done:
+                event_task.cancel()
+                await asyncio.gather(event_task, return_exceptions=True)
+                break
+
+            evt = event_task.result()
             await self.handle_event(evt)
             await asyncio.sleep(0.01)
 
@@ -203,55 +329,88 @@ class ServiceManager:
         except Exception:
             pass
 
-        for proc in self.processes.values():
+        for name, proc in self.processes.items():
             try:
                 if proc.poll() is None:
+                    print(f"[manager] stop {name}", flush=True)
                     proc.terminate()
             except Exception:
                 pass
 
         await asyncio.sleep(0.5)
 
-        for proc in self.processes.values():
+        for name, proc in self.processes.items():
             try:
                 if proc.poll() is None:
+                    print(f"[manager] kill {name}", flush=True)
                     proc.kill()
             except Exception:
                 pass
 
+        if self.lock:
+            self.lock.release()
+            self.lock = None
+
 
 async def main_async():
+    lock = ProcessLock(MANAGER_LOCK_PATH)
+    if not lock.acquire():
+        print("[manager] another service_manager is already running; exiting", flush=True)
+        return
+
     mgr = ServiceManager()
-    mgr.start_event_bus()
-
-    await asyncio.sleep(1.0)
-
+    mgr.lock = lock
     stop_ev = asyncio.Event()
     loop = asyncio.get_running_loop()
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    def request_stop():
+        stop_ev.set()
+
+    signals = [signal.SIGINT, signal.SIGTERM]
+    if hasattr(signal, "SIGHUP"):
+        signals.append(signal.SIGHUP)
+
+    for sig in signals:
         try:
-            loop.add_signal_handler(sig, stop_ev.set)
-        except NotImplementedError:
+            loop.add_signal_handler(sig, request_stop)
+        except (NotImplementedError, RuntimeError):
+            try:
+                signal.signal(sig, lambda _sig, _frame: loop.call_soon_threadsafe(request_stop))
+            except (OSError, ValueError):
+                pass
+
+    try:
+        mgr.start_event_bus()
+
+        try:
+            await asyncio.wait_for(stop_ev.wait(), timeout=1.0)
+        except asyncio.TimeoutError:
             pass
 
-    run_task = asyncio.create_task(mgr.run())
-    stop_task = asyncio.create_task(stop_ev.wait())
+        if not stop_ev.is_set():
+            run_task = asyncio.create_task(mgr.run(stop_ev))
+            stop_task = asyncio.create_task(stop_ev.wait())
 
-    done, pending = await asyncio.wait(
-        {run_task, stop_task},
-        return_when=asyncio.FIRST_COMPLETED,
-    )
+            done, pending = await asyncio.wait(
+                {run_task, stop_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
 
-    if run_task in pending:
-        run_task.cancel()
-        await asyncio.gather(run_task, return_exceptions=True)
+            if run_task in done:
+                exc = run_task.exception()
+                if exc:
+                    raise exc
 
-    stop_task.cancel()
-    await asyncio.gather(stop_task, return_exceptions=True)
-
-    await mgr.shutdown()
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+    finally:
+        await mgr.shutdown()
 
 
 if __name__ == "__main__":
-    asyncio.run(main_async())
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        pass
