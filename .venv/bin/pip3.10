@@ -1,4 +1,4 @@
-#!/home/ivan/c_proj/lego_train_app/.venv/bin/python
+#!/home/lialogic/proj/lego_train_app/.venv/bin/python
 # -*- coding: utf-8 -*-
 import re
 import sys

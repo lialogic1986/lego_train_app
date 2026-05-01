@@ -1,4 +1,4 @@
-#!/home/ivan/c_proj/esp32-cam/.venv/bin/python3
+#!/home/lialogic/proj/lego_train_app/.venv/bin/python
 # -*- coding: utf-8 -*-
 import re
 import sys

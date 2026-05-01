@@ -23,9 +23,20 @@ class CameraInstance:
     video_port: int
     tele_port: int
     ws_port: int
+    video_snapshot_path: str = ""
     viewer_process: Optional[subprocess.Popen] = None
     ws_console_process: Optional[subprocess.Popen] = None
     ws_console_out: str = ""
+
+
+def safe_filename_id(value: str) -> str:
+    safe = []
+    for ch in value:
+        if ch.isalnum() or ch in ("-", "_", "."):
+            safe.append(ch)
+        else:
+            safe.append("_")
+    return "".join(safe) or "camera"
 
 
 class PortAllocator:
@@ -94,7 +105,9 @@ class ServiceManager:
             return inst
 
         video_port, tele_port, ws_port = self.alloc.alloc_camera_ports()
-        ws_log = self.root / "tmp" / f"ws_console_{camera_id}.log"
+        safe_camera_id = safe_filename_id(camera_id)
+        ws_log = self.root / "tmp" / f"ws_console_{safe_camera_id}.log"
+        video_snapshot = self.root / "tmp" / f"video_{safe_camera_id}.jpg"
 
         viewer_name = f"viewer_{camera_id}"
         ws_name = f"ws_console_{camera_id}"
@@ -104,6 +117,9 @@ class ServiceManager:
             str((self.root / "viewer_udp_mjpeg_aruco_range.py").resolve()),
             "--config", "host_config.json",
             "--port", str(video_port),
+            "--snapshot-path", str(video_snapshot),
+            "--snapshot-fps", "50",
+            "--no-window",
         ]
 
         ws_cmd = [
@@ -124,6 +140,7 @@ class ServiceManager:
             video_port=video_port,
             tele_port=tele_port,
             ws_port=ws_port,
+            video_snapshot_path=str(video_snapshot),
             viewer_process=viewer_proc,
             ws_console_process=ws_proc,
             ws_console_out=str(ws_log),

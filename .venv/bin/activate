@@ -38,7 +38,7 @@ deactivate () {
 # unset irrelevant variables
 deactivate nondestructive
 
-VIRTUAL_ENV=/home/ivan/c_proj/lego_train_app/.venv
+VIRTUAL_ENV=/home/lialogic/proj/lego_train_app/.venv
 export VIRTUAL_ENV
 
 _OLD_VIRTUAL_PATH="$PATH"

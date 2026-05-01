@@ -23,8 +23,8 @@
   "provisioning": {
     "host_ip_peer": "1.1.1.1",
     "host_ip_iface": "wlp0s20f3",
-    "ssid": "lialogic_home",
-    "pass": "02121986",
+    "ssid": "TP-Link_79AE",
+    "pass": "43944156",
     "video_port": 5000,
     "tele_port": 8000,
     "ws_port": 8000

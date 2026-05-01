@@ -1,4 +1,5 @@
 import argparse
+import os
 import socket
 import struct
 import time
@@ -30,6 +31,42 @@ DEFAULTS = {
         "th_stop_m": 0.2
     }
 }
+
+
+class SnapshotWriter:
+    def __init__(self, path: str, fps: float = 10.0, quality: int = 80):
+        self.path = path
+        self.tmp_path = f"{path}.tmp"
+        self.interval_s = 1.0 / max(0.1, float(fps))
+        self.quality = max(1, min(100, int(quality)))
+        self.last_write_s = 0.0
+
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+    def write(self, img):
+        now = now_s()
+        if now - self.last_write_s < self.interval_s:
+            return
+
+        ok, encoded = cv2.imencode(
+            ".jpg",
+            img,
+            [int(cv2.IMWRITE_JPEG_QUALITY), self.quality],
+        )
+        if not ok:
+            return
+
+        try:
+            with open(self.tmp_path, "wb") as f:
+                f.write(encoded.tobytes())
+            os.replace(self.tmp_path, self.path)
+            self.last_write_s = now
+        except OSError:
+            # On Windows, an occasional reader/writer collision can happen.
+            # Skipping one snapshot is better than stalling the video loop.
+            return
 
 
 
@@ -202,6 +239,9 @@ def main():
     ap.add_argument("--dict", default=None)
 
     ap.add_argument("--window", default="ArUco Range (click window, press C)")
+    ap.add_argument("--no-window", action="store_true", help="Do not open an OpenCV window")
+    ap.add_argument("--snapshot-path", default="", help="Write the latest annotated frame as JPEG")
+    ap.add_argument("--snapshot-fps", type=float, default=10.0, help="Max snapshot writes per second")
     ap.add_argument("--calib-dist", type=float, default=None)
     ap.add_argument("--ema", type=float, default=None)
     ap.add_argument("--cooldown", type=float, default=None)
@@ -235,6 +275,8 @@ def main():
     th_stop = args.th_stop if args.th_stop is not None else float(get_path(cfg, "range.th_stop_m", 0.2))
 
     detector = make_aruco_detector(dict_name)
+    snapshot_writer = SnapshotWriter(args.snapshot_path, fps=args.snapshot_fps) if args.snapshot_path else None
+    show_window = not args.no_window
 
     source_ip_filter = (source_ip or "").strip() or None
 
@@ -245,8 +287,9 @@ def main():
     frame_timeout_s = max(0.01, args.frame_timeout_ms / 1000.0)
     asm = FrameAssembler(frame_timeout_s=frame_timeout_s)
 
-    cv2.namedWindow(args.window, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(args.window, 640, 480)
+    if show_window:
+        cv2.namedWindow(args.window, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(args.window, 640, 480)
 
     # stats
     frames = 0
@@ -271,6 +314,10 @@ def main():
     print(f"[range] k_area={k_area:.4f} calib_dist={calib_dist:.2f} ema={ema_alpha} cooldown={cooldown_s}")
     print(f"[th] approach<{th_approach:.2f} brake<{th_brake:.2f} stop<{th_stop:.2f}")
     print(f"[video] frame_timeout={frame_timeout_s * 1000.0:.0f} ms (single in-flight frame, drop old on newer frame)")
+    if snapshot_writer:
+        print(f"[video] snapshot={args.snapshot_path} fps<={args.snapshot_fps:.1f}")
+    if not show_window:
+        print("[video] OpenCV window disabled")
 
     while True:
         try:
@@ -344,7 +391,10 @@ def main():
                     # HUD (compact for 320x240)
                     det_n = 0 if ids is None else len(ids)
                     put(img, f"FPS {fps_print} det {det_n} rej {last_rej_n} {last_det_ms:.1f}ms", 5, 16, 0.45)
-                    put(img, f"Click window; press C to calib @ {calib_dist:.2f}m", 5, 34, 0.45)
+                    if show_window:
+                        put(img, f"Click window; press C to calib @ {calib_dist:.2f}m", 5, 34, 0.45)
+                    else:
+                        put(img, f"calib_dist {calib_dist:.2f}m (window disabled)", 5, 34, 0.45)
                     put(img, f"k_area {k_area:.3f} dict {dict_name}", 5, 52, 0.45)
 
                     if last_best_id is None:
@@ -357,11 +407,18 @@ def main():
 
                     s = asm.stats
                     put(img, f"drop t/o {s.dropped_timeout} repl {s.dropped_replaced} old {s.dropped_old}", 5, 106, 0.42)
-                    put(img, f"TH <{th_approach:.2f}/{th_brake:.2f}/{th_stop:.2f}m ESC/q exit", 5, 124, 0.42)
+                    if show_window:
+                        put(img, f"TH <{th_approach:.2f}/{th_brake:.2f}/{th_stop:.2f}m ESC/q exit", 5, 124, 0.42)
+                    else:
+                        put(img, f"TH <{th_approach:.2f}/{th_brake:.2f}/{th_stop:.2f}m embedded", 5, 124, 0.42)
 
-                    cv2.imshow(args.window, img)
+                    if snapshot_writer:
+                        snapshot_writer.write(img)
 
-        key = cv2.waitKey(1) & 0xFF
+                    if show_window:
+                        cv2.imshow(args.window, img)
+
+        key = (cv2.waitKey(1) & 0xFF) if show_window else 0xFF
         if key in (27, ord('q')):
             break
 
@@ -379,7 +436,8 @@ def main():
             else:
                 print("CALIB: no marker visible")
 
-    cv2.destroyAllWindows()
+    if show_window:
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

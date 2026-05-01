@@ -8,14 +8,32 @@ import tkinter as tk
 from dataclasses import dataclass, field
 from tkinter import ttk
 
+import cv2
+
 from event_client import EventClient
 
 
 MODULE_OFFLINE_TIMEOUT = 10.0
 SECTION_REMOVE_TIMEOUT = 30.0
-POWER_STEP = 10
+POWER_STEP = 20
 POWER_MIN = -100
 POWER_MAX = 100
+VIDEO_POLL_MS = 20
+INITIAL_WINDOW_WIDTH = 1600
+INITIAL_WINDOW_HEIGHT = 1350
+MIN_WINDOW_WIDTH = 900
+MIN_WINDOW_HEIGHT = 760
+SCREEN_MARGIN = 80
+
+
+def safe_filename_id(value: str) -> str:
+    safe = []
+    for ch in value:
+        if ch.isalnum() or ch in ("-", "_", "."):
+            safe.append(ch)
+        else:
+            safe.append("_")
+    return "".join(safe) or "camera"
 
 
 def clamp_power(v: int) -> int:
@@ -36,6 +54,8 @@ class TrainSectionState:
     terminal_lines: list[str] = field(default_factory=list)
     terminal_path: str = ""
     terminal_offset: int = 0
+    video_path: str = ""
+    video_mtime_ns: int = 0
 
     @property
     def title(self) -> str:
@@ -140,12 +160,34 @@ class TrainSectionWidget:
         ttk.Label(info, textvariable=self.lego_id_var).pack(anchor="w")
         ttk.Label(info, textvariable=self.camera_id_var).pack(anchor="w")
 
+        video_wrap = ttk.Frame(self.frame)
+        video_wrap.pack(fill="x", padx=8, pady=(2, 6))
+
+        self.video_canvas = tk.Canvas(
+            video_wrap,
+            width=640,
+            height=480,
+            bg="black",
+            highlightthickness=1,
+            highlightbackground="#555",
+        )
+        self.video_canvas.pack(anchor="w")
+        self.video_photo = None
+        self.video_image_id = None
+        self.video_text_id = self.video_canvas.create_text(
+            320,
+            240,
+            text="Camera offline",
+            fill="#d8d8d8",
+            font=("Arial", 14),
+        )
+
         controls = ttk.Frame(self.frame)
         controls.pack(fill="x", padx=8, pady=(2, 6))
 
         self.btn_back = ttk.Button(
             controls,
-            text="Backward -10%",
+            text="Forward -20%",
             command=lambda: self._change_power(-POWER_STEP),
             state="disabled",
         )
@@ -161,7 +203,7 @@ class TrainSectionWidget:
 
         self.btn_fwd = ttk.Button(
             controls,
-            text="Forward +10%",
+            text="Backward +20%",
             command=lambda: self._change_power(+POWER_STEP),
             state="disabled",
         )
@@ -239,6 +281,26 @@ class TrainSectionWidget:
         self.term.see("end")
         self.term.configure(state="disabled")
 
+    def set_video_photo(self, photo: tk.PhotoImage):
+        self.video_photo = photo
+        if self.video_image_id is None:
+            self.video_image_id = self.video_canvas.create_image(
+                320,
+                240,
+                image=self.video_photo,
+                anchor="center",
+            )
+        else:
+            self.video_canvas.itemconfig(self.video_image_id, image=self.video_photo)
+        self.video_canvas.itemconfig(self.video_text_id, text="")
+
+    def clear_video(self, message: str):
+        self.video_photo = None
+        if self.video_image_id is not None:
+            self.video_canvas.delete(self.video_image_id)
+            self.video_image_id = None
+        self.video_canvas.itemconfig(self.video_text_id, text=message)
+
     def set_state(self, st: TrainSectionState):
         self.state = st
 
@@ -273,12 +335,17 @@ class TrainSectionWidget:
             text="Camera terminal" if st.camera_online else "Camera terminal (offline)"
         )
 
+        if not st.camera_online:
+            self.clear_video("Camera offline")
+        elif self.video_photo is None:
+            self.clear_video("Waiting for video...")
+
 
 class TrainGuiApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("LEGO Train GUI")
-        self.root.geometry("1600x900")
+        self._set_initial_window_size()
 
         self.inbox: queue.Queue = queue.Queue()
         self.bus = BusWorker(self.inbox)
@@ -316,9 +383,19 @@ class TrainGuiApp:
         self.canvas.pack(side="left", fill="both", expand=True)
         self.scroll.pack(side="right", fill="y")
 
+    def _set_initial_window_size(self):
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        width = min(INITIAL_WINDOW_WIDTH, max(MIN_WINDOW_WIDTH, screen_w - SCREEN_MARGIN))
+        height = min(INITIAL_WINDOW_HEIGHT, max(MIN_WINDOW_HEIGHT, screen_h - SCREEN_MARGIN))
+
+        self.root.geometry(f"{width}x{height}")
+        self.root.minsize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
+
     def start(self):
         self.bus.start()
         self.root.after(100, self._poll_events)
+        self.root.after(VIDEO_POLL_MS, self._poll_video_snapshots)
         self.root.after(1000, self._housekeeping)
 
     def _alloc_section_id(self) -> str:
@@ -326,8 +403,12 @@ class TrainGuiApp:
         return f"Train-{self._seq:02d}"
 
     def _default_terminal_path(self, camera_id: str) -> str:
-        safe = camera_id.replace("/", "_").replace("\\", "_").replace(" ", "_")
+        safe = safe_filename_id(camera_id)
         return os.path.join(self.ws_console_log_dir, f"ws_console_{safe}.log")
+
+    def _default_video_path(self, camera_id: str) -> str:
+        safe = safe_filename_id(camera_id)
+        return os.path.join(self.ws_console_log_dir, f"video_{safe}.jpg")
 
     def _ensure_section_by_train(self, train_id: str) -> TrainSectionState:
         if train_id not in self.sections:
@@ -348,6 +429,7 @@ class TrainGuiApp:
         self.widgets[section_id] = TrainSectionWidget(self.inner, self.bus.emit)
         self.camera_to_section[camera_id] = section_id
         self.sections[section_id].terminal_path = self._default_terminal_path(camera_id)
+        self.sections[section_id].video_path = self._default_video_path(camera_id)
         self._refresh_section(section_id)
         return self.sections[section_id]
 
@@ -389,6 +471,10 @@ class TrainGuiApp:
                 train_st.terminal_offset = cam_st.terminal_offset
             if cam_st.terminal_lines:
                 train_st.terminal_lines.extend(cam_st.terminal_lines)
+            if cam_st.video_path and not train_st.video_path:
+                train_st.video_path = cam_st.video_path
+            if cam_st.video_mtime_ns and train_st.video_mtime_ns == 0:
+                train_st.video_mtime_ns = cam_st.video_mtime_ns
 
             self.camera_to_section[camera_id] = train_section_id
             self._remove_section(cam_section_id)
@@ -422,6 +508,8 @@ class TrainGuiApp:
             self.camera_to_section[camera_id] = train_id
             if not st.terminal_path:
                 st.terminal_path = self._default_terminal_path(camera_id)
+            if not st.video_path:
+                st.video_path = self._default_video_path(camera_id)
         if camera_addr:
             st.camera_addr = camera_addr
 
@@ -436,6 +524,8 @@ class TrainGuiApp:
             st.camera_addr = camera_addr
         if not st.terminal_path:
             st.terminal_path = self._default_terminal_path(camera_id)
+        if not st.video_path:
+            st.video_path = self._default_video_path(camera_id)
         st.camera_last_seen = time.monotonic()
         self._refresh_section(st.section_id)
 
@@ -475,6 +565,59 @@ class TrainGuiApp:
         for line in chunk.splitlines():
             st.terminal_lines.append(line)
             self.widgets[section_id].append_terminal(line)
+
+    def _make_video_photo(self, path: str) -> tk.PhotoImage | None:
+        img = cv2.imread(path, cv2.IMREAD_COLOR)
+        if img is None:
+            return None
+
+        max_w, max_h = 640, 480
+        h, w = img.shape[:2]
+        if w <= 0 or h <= 0:
+            return None
+
+        scale = min(max_w / w, max_h / h)
+        out_w = max(1, int(w * scale))
+        out_h = max(1, int(h * scale))
+        if out_w != w or out_h != h:
+            img = cv2.resize(img, (out_w, out_h), interpolation=cv2.INTER_AREA)
+
+        ok, encoded = cv2.imencode(".ppm", img)
+        if not ok:
+            return None
+
+        return tk.PhotoImage(data=encoded.tobytes(), format="PPM")
+
+    def _read_video_snapshot(self, section_id: str):
+        st = self.sections.get(section_id)
+        widget = self.widgets.get(section_id)
+        if not st or not widget or not st.camera_online:
+            return
+
+        if not st.video_path and st.camera_id:
+            st.video_path = self._default_video_path(st.camera_id)
+        if not st.video_path:
+            return
+
+        try:
+            stat = os.stat(st.video_path)
+        except FileNotFoundError:
+            if widget.video_photo is None:
+                widget.clear_video("Waiting for video...")
+            return
+        except OSError:
+            return
+
+        mtime_ns = getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))
+        if mtime_ns == st.video_mtime_ns:
+            return
+
+        photo = self._make_video_photo(st.video_path)
+        if photo is None:
+            return
+
+        st.video_mtime_ns = mtime_ns
+        widget.set_video_photo(photo)
 
     def handle_event(self, evt: dict):
         etype = evt.get("type")
@@ -548,6 +691,12 @@ class TrainGuiApp:
             pass
 
         self.root.after(100, self._poll_events)
+
+    def _poll_video_snapshots(self):
+        for section_id in list(self.sections.keys()):
+            self._read_video_snapshot(section_id)
+
+        self.root.after(VIDEO_POLL_MS, self._poll_video_snapshots)
 
     def _housekeeping(self):
         for section_id in list(self.sections.keys()):
