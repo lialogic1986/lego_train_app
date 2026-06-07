@@ -161,6 +161,7 @@ class DeviceConn:
     ws: WebSocketServerProtocol
     last_seen: float = field(default_factory=time.time)
     peer_ip: str = ""
+    fw: str = ""
 
 
 class ConsoleServer:
@@ -284,6 +285,24 @@ class ConsoleServer:
 
     async def on_msg(self, device_id: str, msg: Dict[str, Any]) -> None:
         mtype = msg.get("type", "unknown")
+
+        if mtype == "hello":
+            fw = str(msg.get("fw") or "")
+            if device_id in self.devices:
+                self.devices[device_id].fw = fw
+
+            self.log(f"{device_id} hello fw={fw or '-'} raw={self._compact(msg)}")
+            await self.emit_bus(
+                "camera_hello",
+                {
+                    "train_id": self.train_id,
+                    "camera_id": self.camera_id,
+                    "device_id": device_id,
+                    "fw": fw,
+                    "raw": msg,
+                },
+            )
+            return
 
         if mtype == "hb":
             self.log(f"{device_id} ♥ hb uptime_ms={msg.get('uptime_ms')} raw={self._compact(msg)}")
