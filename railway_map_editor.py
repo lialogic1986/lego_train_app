@@ -265,6 +265,7 @@ class RailwayMapEditor(ttk.Frame):
         self.redraw()
 
     def select(self, kind: str, item_id: str):
+        self.apply_marker_properties(refresh=False, show_errors=False)
         self.selected_kind = kind
         self.selected_id = item_id
         self._refresh_properties()
@@ -287,6 +288,7 @@ class RailwayMapEditor(ttk.Frame):
         self.redraw()
 
     def delete_selected(self):
+        self.apply_marker_properties(refresh=False, show_errors=False)
         if self.selected_kind == "track":
             self.map.elements = [e for e in self.map.elements if e.id != self.selected_id]
         elif self.selected_kind == "marker":
@@ -499,7 +501,9 @@ class RailwayMapEditor(ttk.Frame):
         body = self.props_body
         body.columnconfigure(1, weight=1)
         ttk.Label(body, text="ArUco Marker", font=("Arial", 11, "bold")).grid(row=0, column=0, columnspan=2, sticky="w")
-        self._add_labeled_entry(body, 1, "marker_id", self.marker_id_var)
+        marker_id_entry = self._add_labeled_entry(body, 1, "marker_id", self.marker_id_var)
+        marker_id_entry.bind("<Return>", lambda _event: self.apply_marker_properties())
+        marker_id_entry.bind("<FocusOut>", lambda _event: self.apply_marker_properties(refresh=False, show_errors=False))
         ttk.Label(body, text=f"front rotation: {marker.rotation} deg").grid(row=2, column=0, columnspan=2, sticky="w")
         ttk.Checkbutton(body, text="Interpolate power every 1 cm", variable=self.interpolate_power_var).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
@@ -592,19 +596,21 @@ class RailwayMapEditor(ttk.Frame):
                 self.redraw()
                 return
 
-    def apply_marker_properties(self, refresh: bool = True):
+    def apply_marker_properties(self, refresh: bool = True, show_errors: bool = True) -> bool:
         marker = self.selected_marker()
         if not marker:
-            return
+            return True
         try:
             marker.marker_id = int(self.marker_id_var.get())
             marker.actions.interpolate_power = bool(self.interpolate_power_var.get())
         except Exception as e:
-            messagebox.showerror("Bad marker config", str(e))
-            return
+            if show_errors:
+                messagebox.showerror("Bad marker config", str(e))
+            return False
         self.status_var.set("Marker properties applied")
         if refresh:
             self.redraw()
+        return True
 
     def to_json(self) -> dict:
         self.map.updated_ms = int(time.time() * 1000)
@@ -618,13 +624,19 @@ class RailwayMapEditor(ttk.Frame):
         }
 
     def save(self):
+        if not self.apply_marker_properties(refresh=False):
+            return
+        payload = self.to_json()
         try:
             with open(MAP_CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump(self.to_json(), f, indent=2, ensure_ascii=False)
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+            with open(MAP_CONFIG_PATH, "r", encoding="utf-8") as f:
+                saved = json.load(f)
         except Exception as e:
             messagebox.showerror("Save failed", str(e))
             return
-        self.status_var.set(f"Saved {MAP_CONFIG_PATH}")
+        marker_ids = [str(m.get("marker_id", "?")) for m in saved.get("markers", [])]
+        self.status_var.set(f"Saved {MAP_CONFIG_PATH}; markers: {', '.join(marker_ids) or '-'}")
 
     def load(self, silent: bool = False):
         if not os.path.exists(MAP_CONFIG_PATH):

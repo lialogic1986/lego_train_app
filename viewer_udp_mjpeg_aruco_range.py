@@ -458,11 +458,6 @@ def main():
                         frames = 0
                         last_stat = now
 
-                    # Minimal HUD for the dashboard snapshot. Detailed telemetry is shown in GUI Console.
-                    put(img, f"FPS {fps_print}", 5, 16, 0.45)
-                    df = "-" if best is None or dist_f is None or not np.isfinite(dist_f) else f"{dist_f:.2f}m"
-                    put(img, f"distance {df}", 5, 34, 0.45)
-
                     if snapshot_writer:
                         snapshot_writer.write(img)
 

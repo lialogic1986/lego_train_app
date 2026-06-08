@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 import asyncio
+import json
+import math
 import os
 import queue
 import threading
 import time
 import tkinter as tk
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from tkinter import filedialog, ttk
 
 import cv2
 
 from event_client import EventClient
-from railway_map_editor import RailwayMapEditor
+from railway_map_editor import MAP_CONFIG_PATH, TRACK_LIBRARY, RailwayMapEditor, rotate_point
 
 
 MODULE_OFFLINE_TIMEOUT = 10.0
@@ -31,10 +33,14 @@ INITIAL_WINDOW_HEIGHT = 1350
 MIN_WINDOW_WIDTH = 900
 MIN_WINDOW_HEIGHT = 760
 SCREEN_MARGIN = 80
-SECTION_WIDE_LAYOUT_MIN_WIDTH = 1250
+SECTION_WIDE_LAYOUT_MIN_WIDTH = 1900
 SECTION_MAX_COLUMNS = 2
 SECTION_GRID_PAD_X = 8
 SECTION_GRID_PAD_Y = 6
+REALTIME_MAP_HEIGHT = 360
+REALTIME_MAP_PADDING_PX = 28
+REALTIME_MAP_RELOAD_INTERVAL_S = 1.0
+TRAIN_MARKER_STALE_S = 8.0
 
 
 def safe_filename_id(value: str) -> str:
@@ -69,12 +75,16 @@ class TrainSectionState:
     terminal_offset: int = 0
     video_path: str = ""
     video_mtime_ns: int = 0
+    video_last_frame_s: float = 0.0
+    video_fps: float = 0.0
     marker_id: str = ""
     marker_distance_m: float | None = None
     marker_distance_raw_m: float | None = None
     marker_area_px: float | None = None
     marker_dict: str = ""
     marker_last_seen: float = 0.0
+    marker_speed_mps: float | None = None
+    marker_branch: str = ""
 
     @property
     def title(self) -> str:
@@ -140,6 +150,574 @@ class BusWorker:
         fut.add_done_callback(_done)
 
 
+class RealtimeRailwayView:
+    def __init__(self, parent, map_provider=None):
+        self.map_provider = map_provider
+        self.frame = ttk.LabelFrame(parent, text="Realtime railway")
+        self.frame.columnconfigure(0, weight=1)
+        self.frame.rowconfigure(0, weight=1)
+
+        self.canvas = tk.Canvas(
+            self.frame,
+            height=REALTIME_MAP_HEIGHT,
+            bg="#18241f",
+            highlightthickness=1,
+            highlightbackground="#415249",
+        )
+        self.canvas.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        self.canvas.bind("<Configure>", lambda _event: self.redraw())
+
+        self.elements: list[dict] = []
+        self.markers: list[dict] = []
+        self.markers_by_id: dict[int, dict] = {}
+        self.last_mtime = 0.0
+        self.last_reload_s = 0.0
+        self.trains: dict[str, TrainSectionState] = {}
+
+    def set_trains(self, trains: dict[str, TrainSectionState]):
+        self.trains = trains
+        self.redraw()
+
+    def refresh(self):
+        self._load_if_needed()
+        self.redraw()
+
+    def _load_if_needed(self):
+        if self.map_provider:
+            data = self.map_provider()
+            self._apply_map_data(data)
+            return
+
+        now = time.monotonic()
+        if now - self.last_reload_s < REALTIME_MAP_RELOAD_INTERVAL_S:
+            return
+        self.last_reload_s = now
+
+        try:
+            mtime = os.path.getmtime(MAP_CONFIG_PATH)
+        except OSError:
+            self.elements = []
+            self.markers = []
+            self.markers_by_id = {}
+            self.last_mtime = 0.0
+            return
+
+        if mtime == self.last_mtime:
+            return
+
+        try:
+            with open(MAP_CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return
+
+        self._apply_map_data(data)
+        self.last_mtime = mtime
+
+    def _apply_map_data(self, data: dict):
+        self.elements = list(data.get("elements", []))
+        self.markers = list(data.get("markers", []))
+        self.markers_by_id = {}
+        for marker in self.markers:
+            try:
+                self.markers_by_id[int(marker.get("marker_id"))] = marker
+            except (TypeError, ValueError):
+                continue
+
+    def redraw(self):
+        self._load_if_needed()
+        self.canvas.delete("all")
+
+        w = max(1, self.canvas.winfo_width())
+        h = max(1, self.canvas.winfo_height())
+        if not self.elements and not self.markers:
+            self.canvas.create_text(
+                w // 2,
+                h // 2,
+                text="No railway_map.json",
+                fill="#b7c8be",
+                font=("Arial", 14),
+            )
+            return
+
+        train_positions = self._train_positions()
+        bounds = self._bounds(train_positions)
+        if not bounds:
+            return
+
+        min_x, min_y, max_x, max_y = bounds
+        span_x = max(1.0, max_x - min_x)
+        span_y = max(1.0, max_y - min_y)
+        scale = min(
+            (w - REALTIME_MAP_PADDING_PX * 2) / span_x,
+            (h - REALTIME_MAP_PADDING_PX * 2) / span_y,
+        )
+        scale = max(0.05, scale)
+        offset_x = (w - span_x * scale) / 2
+        offset_y = (h - span_y * scale) / 2
+
+        def sx(x_mm: float) -> float:
+            return offset_x + (x_mm - min_x) * scale
+
+        def sy(y_mm: float) -> float:
+            return offset_y + (y_mm - min_y) * scale
+
+        self._draw_background(w, h)
+        for elem in self.elements:
+            self._draw_track(elem, sx, sy, scale)
+        for marker in self.markers:
+            self._draw_marker(marker, sx, sy, scale)
+        for train_id, pos in train_positions.items():
+            self._draw_train(train_id, pos, sx, sy, scale)
+
+    def _draw_background(self, w: int, h: int):
+        self.canvas.create_rectangle(0, 0, w, h, fill="#18241f", outline="")
+        step = 48
+        for x in range(0, w + step, step):
+            self.canvas.create_line(x, 0, x, h, fill="#20332b")
+        for y in range(0, h + step, step):
+            self.canvas.create_line(0, y, w, y, fill="#20332b")
+
+    def _draw_track(self, elem: dict, sx, sy, scale: float):
+        kind = elem.get("kind", "straight")
+        if TRACK_LIBRARY.get(kind, {}).get("draw") == "straight":
+            points = self._straight_points(elem)
+        elif "curve" in kind:
+            points = self._curve_points(elem)
+        else:
+            for points in self._switch_paths(elem):
+                self._draw_track_path(points, sx, sy, scale)
+            return
+        self._draw_track_path(points, sx, sy, scale)
+
+    def _draw_track_path(self, points: list[tuple[float, float]], sx, sy, scale: float):
+        if len(points) < 2:
+            return
+        coords = []
+        for x, y in points:
+            coords.extend((sx(x), sy(y)))
+
+        ballast_w = max(10, int(22 * min(scale, 1.4)))
+        rail_w = max(3, int(5 * min(scale, 1.3)))
+        self.canvas.create_line(*coords, fill="#4d4b45", width=ballast_w, capstyle="round", joinstyle="round", smooth=len(points) > 2)
+        self.canvas.create_line(*coords, fill="#a9b0aa", width=rail_w, capstyle="round", joinstyle="round", smooth=len(points) > 2)
+
+        if len(points) == 2:
+            self._draw_sleepers(points[0], points[1], sx, sy, scale)
+
+    def _draw_sleepers(self, p1, p2, sx, sy, scale: float):
+        x1, y1 = p1
+        x2, y2 = p2
+        length = math.hypot(x2 - x1, y2 - y1)
+        if length < 1:
+            return
+        ux = (x2 - x1) / length
+        uy = (y2 - y1) / length
+        px = -uy
+        py = ux
+        sleeper_half = 24
+        every = 32
+        count = max(1, int(length / every))
+        for i in range(count + 1):
+            t = i / max(1, count)
+            x = x1 + (x2 - x1) * t
+            y = y1 + (y2 - y1) * t
+            self.canvas.create_line(
+                sx(x - px * sleeper_half),
+                sy(y - py * sleeper_half),
+                sx(x + px * sleeper_half),
+                sy(y + py * sleeper_half),
+                fill="#806b4b",
+                width=max(2, int(4 * min(scale, 1.0))),
+            )
+
+    def _draw_marker(self, marker: dict, sx, sy, scale: float):
+        try:
+            marker_id = int(marker.get("marker_id"))
+            x_mm = float(marker.get("x_mm", marker.get("x", 0)))
+            y_mm = float(marker.get("y_mm", marker.get("y", 0)))
+            rotation = float(marker.get("rotation", 0))
+        except (TypeError, ValueError):
+            return
+
+        x = sx(x_mm)
+        y = sy(y_mm)
+        size = max(8, min(20, 18 * scale))
+        front = rotate_point(0, -38, rotation)
+        fx = sx(x_mm + front[0])
+        fy = sy(y_mm + front[1])
+        self.canvas.create_polygon(x, y, fx - 8, fy + 8, fx + 8, fy + 8, fill="#2c89c8", outline="#8bd4ff")
+        self.canvas.create_rectangle(x - size, y - size, x + size, y + size, fill="#f2f6f8", outline="#8bd4ff", width=2)
+        self.canvas.create_text(x, y, text=str(marker_id), fill="#0d1b24", font=("Arial", max(8, int(size)), "bold"))
+
+    def _draw_train(self, train_id: str, pos: dict, sx, sy, scale: float):
+        x_mm = pos["x_mm"]
+        y_mm = pos["y_mm"]
+        rotation = pos["rotation"]
+        x = sx(x_mm)
+        y = sy(y_mm)
+        front = rotate_point(0, -1, rotation)
+        side = rotate_point(1, 0, rotation)
+        length = max(24, min(54, 54 * scale))
+        width = max(14, min(30, 30 * scale))
+        pts = []
+        for lx, ly in ((-width / 2, length / 2), (width / 2, length / 2), (width / 2, -length / 2), (0, -length * 0.75), (-width / 2, -length / 2)):
+            px = x + side[0] * lx + front[0] * ly
+            py = y + side[1] * lx + front[1] * ly
+            pts.extend((px, py))
+        fill = "#ffcf33" if pos.get("online", False) else "#8c8c8c"
+        self.canvas.create_polygon(*pts, fill=fill, outline="#161616", width=2)
+        label = train_id[-8:] if len(train_id) > 8 else train_id
+        self.canvas.create_text(x, y + length * 0.75, text=label, fill="#e7f1ea", font=("Arial", 10, "bold"))
+
+    def _render_info_panel(self, train_positions: dict[str, dict], unmapped_markers: list[dict]):
+        self.info.configure(state="normal")
+        self.info.delete("1.0", "end")
+        self.info.insert(
+            "end",
+            f"Track: {len(self.elements)}   Map signs: {len(self.markers)}   Mapped trains: {len(train_positions)}\n",
+            "title",
+        )
+        if self.markers_by_id:
+            ids = ", ".join(str(mid) for mid in sorted(self.markers_by_id))
+            self.info.insert("end", f"Map sign IDs: {ids}\n", "muted")
+
+        if not train_positions and not unmapped_markers:
+            self.info.insert("end", "\nWaiting for marker_seen...\n", "muted")
+            self.info.configure(state="disabled")
+            return
+
+        for train_id, pos in sorted(train_positions.items()):
+            self._append_train_info(train_id, pos)
+        for item in unmapped_markers:
+            self._append_unmapped_marker_info(item)
+
+        self.info.configure(state="disabled")
+
+    def _append_train_info(self, train_id: str, pos: dict):
+        section_no, section_label = self._nearest_track_info(pos["x_mm"], pos["y_mm"])
+        speed = "n/a" if pos["speed_mps"] is None else f"{pos['speed_mps']:.2f} m/s"
+        next_distance = "-" if pos["next_point_distance_cm"] is None else f"{pos['next_point_distance_cm']:.1f} cm"
+
+        self.info.insert("end", f"\n{train_id}\n", "title")
+        self.info.insert("end", f"Section: {section_no} {section_label}\n")
+        self.info.insert("end", f"Direction: {pos['branch'] or '-'}\n")
+        self.info.insert("end", f"Distance to sign: {pos['distance_m']:.2f} m\n")
+        self.info.insert("end", f"Power: {pos['power']}\n")
+        self.info.insert("end", f"Speed: {speed}\n")
+        self.info.insert("end", f"Next point: {next_distance}\n")
+
+        if not pos["control_points"]:
+            self.info.insert("end", "Control points: -\n", "muted")
+            return
+
+        self.info.insert("end", f"Control points ({pos['branch']}):\n")
+        for idx, point in enumerate(pos["control_points"]):
+            tags = ("interval",) if idx in pos["interval_indexes"] else ()
+            distance = self._point_distance(point)
+            action_type = point.get("action_type", point.get("type", "power"))
+            value = point.get("value", point.get("power", ""))
+            timeout = point.get("timeout_s", 0)
+            prefix = ">>" if idx in pos["interval_indexes"] else "  "
+            self.info.insert(
+                "end",
+                f"{prefix} {distance:6.1f} cm  {action_type:<7} value={value} timeout={timeout}\n",
+                tags,
+            )
+
+    def _append_unmapped_marker_info(self, item: dict):
+        self.info.insert("end", f"\n{item['title']}\n", "title")
+        self.info.insert("end", "Marker is visible, but it is not placed on the current map.\n", "warn")
+        self.info.insert("end", f"Sign ID: {item['marker_id']}\n")
+        self.info.insert("end", f"Distance to sign: {item['distance_m']:.2f} m\n")
+        self.info.insert("end", f"Direction: {item['branch'] or '-'}\n")
+        self.info.insert("end", f"Power: {item['power']}\n")
+        speed = "n/a" if item["speed_mps"] is None else f"{item['speed_mps']:.2f} m/s"
+        self.info.insert("end", f"Speed: {speed}\n")
+
+    def _nearest_track_label(self, x_mm: float, y_mm: float) -> str:
+        return self._nearest_track_info(x_mm, y_mm)[1]
+
+    def _nearest_track_info(self, x_mm: float, y_mm: float) -> tuple[str, str]:
+        best = None
+        for idx, elem in enumerate(self.elements, start=1):
+            kind = elem.get("kind", "track")
+            paths = self._switch_paths(elem) if "switch" in kind else [self._element_points(elem)]
+            for path in paths:
+                distance = self._distance_to_path(x_mm, y_mm, path)
+                if best is None or distance < best[0]:
+                    label = TRACK_LIBRARY.get(kind, {}).get("label", kind)
+                    best = (distance, str(idx), label)
+        if not best:
+            return "-", "-"
+        return best[1], best[2]
+
+    def _distance_to_path(self, x_mm: float, y_mm: float, path: list[tuple[float, float]]) -> float:
+        if not path:
+            return float("inf")
+        if len(path) == 1:
+            return math.hypot(x_mm - path[0][0], y_mm - path[0][1])
+
+        best = float("inf")
+        for p1, p2 in zip(path, path[1:]):
+            best = min(best, self._distance_to_segment(x_mm, y_mm, p1, p2))
+        return best
+
+    def _distance_to_segment(self, x_mm: float, y_mm: float, p1: tuple[float, float], p2: tuple[float, float]) -> float:
+        x1, y1 = p1
+        x2, y2 = p2
+        dx = x2 - x1
+        dy = y2 - y1
+        denom = dx * dx + dy * dy
+        if denom <= 0:
+            return math.hypot(x_mm - x1, y_mm - y1)
+        t = max(0.0, min(1.0, ((x_mm - x1) * dx + (y_mm - y1) * dy) / denom))
+        proj_x = x1 + dx * t
+        proj_y = y1 + dy * t
+        return math.hypot(x_mm - proj_x, y_mm - proj_y)
+
+    def _bounds(self, train_positions: dict[str, dict]) -> tuple[float, float, float, float] | None:
+        points: list[tuple[float, float]] = []
+        for elem in self.elements:
+            points.extend(self._element_points(elem))
+        for marker in self.markers:
+            try:
+                points.append((float(marker.get("x_mm", marker.get("x", 0))), float(marker.get("y_mm", marker.get("y", 0)))))
+            except (TypeError, ValueError):
+                continue
+        for pos in train_positions.values():
+            points.append((pos["x_mm"], pos["y_mm"]))
+        if not points:
+            return None
+        min_x = min(p[0] for p in points) - 160
+        max_x = max(p[0] for p in points) + 160
+        min_y = min(p[1] for p in points) - 160
+        max_y = max(p[1] for p in points) + 160
+        return min_x, min_y, max_x, max_y
+
+    def _element_points(self, elem: dict) -> list[tuple[float, float]]:
+        kind = elem.get("kind", "straight")
+        if TRACK_LIBRARY.get(kind, {}).get("draw") == "straight":
+            return self._straight_points(elem)
+        if "curve" in kind:
+            return self._curve_points(elem)
+        points = []
+        for path in self._switch_paths(elem):
+            points.extend(path)
+        return points
+
+    def _straight_points(self, elem: dict) -> list[tuple[float, float]]:
+        x, y, rotation = self._element_base(elem)
+        length = float(elem.get("length_mm", TRACK_LIBRARY.get(elem.get("kind", ""), {}).get("length_mm", 128.0)))
+        half = length / 2
+        p1 = rotate_point(-half, 0, rotation)
+        p2 = rotate_point(half, 0, rotation)
+        return [(x + p1[0], y + p1[1]), (x + p2[0], y + p2[1])]
+
+    def _curve_points(self, elem: dict) -> list[tuple[float, float]]:
+        x, y, rotation = self._element_base(elem)
+        meta = TRACK_LIBRARY.get(elem.get("kind", ""), {})
+        radius = float(meta.get("radius_studs", 40)) * 8.0
+        signed_angle = float(meta.get("angle_deg", 22.5)) * (1 if elem.get("kind") == "curve_left" else -1)
+        half_angle = abs(signed_angle) / 2
+        chord = 2 * radius * math.sin(math.radians(half_angle))
+        p0 = rotate_point(-chord / 2, 0, rotation)
+        p1 = rotate_point(chord / 2, 0, rotation + signed_angle)
+        return [(x + p0[0], y + p0[1]), (x, y), (x + p1[0], y + p1[1])]
+
+    def _switch_paths(self, elem: dict) -> list[list[tuple[float, float]]]:
+        x, y, rotation = self._element_base(elem)
+        meta = TRACK_LIBRARY.get(elem.get("kind", ""), {})
+        half = float(elem.get("length_mm", meta.get("length_mm", 256.0))) / 2
+        angle = float(meta.get("branch_angle_deg", 22.5)) * (-1 if elem.get("kind") == "switch_left" else 1)
+        main_a = rotate_point(-half, 0, rotation)
+        main_b = rotate_point(half, 0, rotation)
+        branch_b = rotate_point(half * math.cos(math.radians(angle)), half * math.sin(math.radians(angle)), rotation)
+        return [
+            [(x + main_a[0], y + main_a[1]), (x + main_b[0], y + main_b[1])],
+            [(x, y), (x + branch_b[0], y + branch_b[1])],
+        ]
+
+    def _element_base(self, elem: dict) -> tuple[float, float, float]:
+        return (
+            float(elem.get("x_mm", elem.get("x", 0))),
+            float(elem.get("y_mm", elem.get("y", 0))),
+            float(elem.get("rotation", 0)),
+        )
+
+    def section_info(self, section_id: str, st: TrainSectionState) -> dict:
+        self._load_if_needed()
+        info = {
+            "status": "waiting",
+            "map_sign_ids": sorted(self.markers_by_id),
+            "track_count": len(self.elements),
+            "marker_count": len(self.markers),
+        }
+
+        if not st.marker_id or st.marker_distance_m is None:
+            return info
+        if time.monotonic() - st.marker_last_seen > TRAIN_MARKER_STALE_S:
+            info["status"] = "stale"
+            info["marker_id"] = st.marker_id
+            return info
+
+        try:
+            marker = self.markers_by_id[int(st.marker_id)]
+            marker_x = float(marker.get("x_mm", marker.get("x", 0)))
+            marker_y = float(marker.get("y_mm", marker.get("y", 0)))
+            rotation = float(marker.get("rotation", 0))
+        except (KeyError, TypeError, ValueError):
+            info.update({
+                "status": "unmapped",
+                "marker_id": st.marker_id,
+                "distance_m": st.marker_distance_m,
+                "branch": st.marker_branch or "approach",
+            })
+            return info
+
+        front = rotate_point(0, -1, rotation)
+        dist_mm = max(0.0, st.marker_distance_m * 1000.0)
+        x_mm = marker_x + front[0] * dist_mm
+        y_mm = marker_y + front[1] * dist_mm
+        section_no, section_label = self._nearest_track_info(x_mm, y_mm)
+        control = self._control_context(marker, st)
+        info.update({
+            "status": "mapped",
+            "marker_id": st.marker_id,
+            "distance_m": st.marker_distance_m,
+            "x_mm": x_mm,
+            "y_mm": y_mm,
+            "section_no": section_no,
+            "section_label": section_label,
+            "branch": control["branch"],
+            "control_points": control["points"],
+            "interval_indexes": control["interval_indexes"],
+            "next_point_distance_cm": control["next_point_distance_cm"],
+        })
+        return info
+
+    def _train_positions(self) -> dict[str, dict]:
+        now = time.monotonic()
+        positions = {}
+        for section_id, st in self.trains.items():
+            if not st.marker_id or st.marker_distance_m is None:
+                continue
+            if now - st.marker_last_seen > TRAIN_MARKER_STALE_S:
+                continue
+            try:
+                marker = self.markers_by_id[int(st.marker_id)]
+                marker_x = float(marker.get("x_mm", marker.get("x", 0)))
+                marker_y = float(marker.get("y_mm", marker.get("y", 0)))
+                rotation = float(marker.get("rotation", 0))
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            front = rotate_point(0, -1, rotation)
+            dist_mm = max(0.0, st.marker_distance_m * 1000.0)
+            train_id = st.train_id or section_id
+            control = self._control_context(marker, st)
+            positions[train_id] = {
+                "x_mm": marker_x + front[0] * dist_mm,
+                "y_mm": marker_y + front[1] * dist_mm,
+                "rotation": rotation,
+                "online": st.lego_online or st.camera_online,
+                "section_id": section_id,
+                "marker_id": st.marker_id,
+                "distance_m": st.marker_distance_m,
+                "power": st.power,
+                "speed_mps": st.marker_speed_mps,
+                "branch": control["branch"],
+                "control_points": control["points"],
+                "interval_indexes": control["interval_indexes"],
+                "next_point_distance_cm": control["next_point_distance_cm"],
+            }
+        return positions
+
+    def _unmapped_marker_states(self, train_positions: dict[str, dict]) -> list[dict]:
+        now = time.monotonic()
+        mapped_sections = {pos["section_id"] for pos in train_positions.values()}
+        out = []
+        for section_id, st in self.trains.items():
+            if section_id in mapped_sections:
+                continue
+            if not st.marker_id or st.marker_distance_m is None:
+                continue
+            if now - st.marker_last_seen > TRAIN_MARKER_STALE_S:
+                continue
+            try:
+                marker_id = int(st.marker_id)
+            except (TypeError, ValueError):
+                marker_id = None
+            if marker_id in self.markers_by_id:
+                continue
+            out.append(
+                {
+                    "title": st.train_id or st.camera_id or section_id,
+                    "marker_id": st.marker_id,
+                    "distance_m": st.marker_distance_m,
+                    "speed_mps": st.marker_speed_mps,
+                    "branch": st.marker_branch,
+                    "power": st.power,
+                }
+            )
+        return out
+
+    def _control_context(self, marker: dict, st: TrainSectionState) -> dict:
+        branch = st.marker_branch or "approach"
+        raw_points = list(marker.get("actions", {}).get(branch, {}).get("points", []))
+        points = self._sorted_control_points(branch, raw_points)
+        distance_cm = (st.marker_distance_m or 0.0) * 100.0
+        interval_indexes = self._control_interval_indexes(branch, points, distance_cm)
+        next_point_distance_cm = self._next_point_distance_cm(branch, points, distance_cm)
+        return {
+            "branch": branch,
+            "points": points,
+            "interval_indexes": interval_indexes,
+            "next_point_distance_cm": next_point_distance_cm,
+        }
+
+    def _sorted_control_points(self, branch: str, points: list[dict]) -> list[dict]:
+        return sorted(points, key=self._point_distance, reverse=(branch == "approach"))
+
+    def _control_interval_indexes(self, branch: str, points: list[dict], distance_cm: float) -> set[int]:
+        if not points:
+            return set()
+        if len(points) == 1:
+            return {0}
+        for idx, (left, right) in enumerate(zip(points, points[1:])):
+            d1 = self._point_distance(left)
+            d2 = self._point_distance(right)
+            if min(d1, d2) <= distance_cm <= max(d1, d2):
+                return {idx, idx + 1}
+
+        distances = [self._point_distance(p) for p in points]
+        if branch == "approach":
+            if distance_cm > max(distances):
+                return {0}
+            return {len(points) - 1}
+        if distance_cm < min(distances):
+            return {0}
+        return {len(points) - 1}
+
+    def _next_point_distance_cm(self, branch: str, points: list[dict], distance_cm: float) -> float | None:
+        if branch == "approach":
+            candidates = [self._point_distance(p) for p in points if self._point_distance(p) <= distance_cm]
+            if not candidates:
+                return None
+            return max(0.0, distance_cm - max(candidates))
+
+        candidates = [self._point_distance(p) for p in points if self._point_distance(p) >= distance_cm]
+        if not candidates:
+            return None
+        return max(0.0, min(candidates) - distance_cm)
+
+    def _point_distance(self, point: dict) -> float:
+        try:
+            return float(point.get("distance_cm", 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+
 class TrainSectionWidget:
     def __init__(self, dashboard_parent, diagnostics_parent, send_cb):
         self.send_cb = send_cb
@@ -148,8 +726,21 @@ class TrainSectionWidget:
         self.frame = ttk.LabelFrame(dashboard_parent, text="Train")
         self.diagnostics_frame = ttk.LabelFrame(diagnostics_parent, text="Train diagnostics")
 
-        status = ttk.Frame(self.frame)
-        status.pack(fill="x", padx=8, pady=(8, 4))
+        dashboard_body = ttk.Frame(self.frame)
+        dashboard_body.pack(fill="both", expand=True, padx=8, pady=8)
+        dashboard_body.columnconfigure(0, weight=0)
+        dashboard_body.columnconfigure(1, weight=1)
+        dashboard_body.rowconfigure(0, weight=1)
+
+        self.video_wrap = ttk.Frame(dashboard_body)
+        self.video_wrap.grid(row=0, column=0, sticky="nw")
+
+        self.side_wrap = ttk.Frame(dashboard_body)
+        self.side_wrap.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+        self.side_wrap.columnconfigure(0, weight=1)
+
+        status = ttk.Frame(self.side_wrap)
+        status.grid(row=0, column=0, sticky="ew", pady=(0, 6))
 
         ttk.Label(status, text="LEGO:").grid(row=0, column=0, sticky="w")
         self.lego_indicator = tk.Canvas(status, width=18, height=18, highlightthickness=0)
@@ -167,9 +758,6 @@ class TrainSectionWidget:
 
         self.power_var = tk.StringVar(value="power: 0")
         ttk.Label(status, textvariable=self.power_var).grid(row=0, column=6, padx=(20, 0), sticky="w")
-
-        self.video_wrap = ttk.Frame(self.frame)
-        self.video_wrap.pack(fill="x", padx=8, pady=(2, 6))
 
         self.video_canvas = tk.Canvas(
             self.video_wrap,
@@ -190,8 +778,8 @@ class TrainSectionWidget:
             font=("Arial", 14),
         )
 
-        controls = ttk.Frame(self.frame)
-        controls.pack(fill="x", padx=8, pady=(2, 6))
+        controls = ttk.Frame(self.side_wrap)
+        controls.grid(row=1, column=0, sticky="ew", pady=(0, 8))
 
         self.btn_back = ttk.Button(
             controls,
@@ -216,6 +804,15 @@ class TrainSectionWidget:
             state="disabled",
         )
         self.btn_fwd.pack(side="left", padx=4)
+
+        self.live_info = tk.Text(self.side_wrap, height=22, width=46, wrap="word", borderwidth=1, relief="solid")
+        self.live_info.grid(row=2, column=0, sticky="nsew")
+        self.side_wrap.rowconfigure(2, weight=1)
+        self.live_info.configure(state="disabled")
+        self.live_info.tag_configure("title", font=("Arial", 10, "bold"))
+        self.live_info.tag_configure("muted", foreground="#606060")
+        self.live_info.tag_configure("interval", background="#fff2a8")
+        self.live_info.tag_configure("warn", foreground="#a55d00")
 
         self._build_diagnostics()
 
@@ -368,6 +965,13 @@ class TrainSectionWidget:
         self.term.see("end")
         self.term.configure(state="disabled")
 
+    def set_live_info(self, parts: list[tuple[str, str]]):
+        self.live_info.configure(state="normal")
+        self.live_info.delete("1.0", "end")
+        for text, tag in parts:
+            self.live_info.insert("end", text, tag or None)
+        self.live_info.configure(state="disabled")
+
     def set_video_photo(self, photo: tk.PhotoImage):
         self.video_photo = photo
         if self.video_image_id is None:
@@ -494,6 +1098,7 @@ class TrainGuiApp:
         self.canvas = tk.Canvas(self.main, highlightthickness=0)
         self.scroll = ttk.Scrollbar(self.main, orient="vertical", command=self.canvas.yview)
         self.inner = ttk.Frame(self.canvas)
+        self.realtime_map = RealtimeRailwayView(self.inner, self._current_map_data)
 
         self.inner.bind(
             "<Configure>",
@@ -564,6 +1169,73 @@ class TrainGuiApp:
         safe = safe_filename_id(camera_id)
         return os.path.join(self.ws_console_log_dir, f"video_{safe}.jpg")
 
+    def _current_map_data(self) -> dict:
+        return {
+            "elements": [asdict(e) for e in self.map_tab.map.elements],
+            "markers": [asdict(m) for m in self.map_tab.map.markers],
+        }
+
+    def _dashboard_info_parts(self, section_id: str) -> list[tuple[str, str]]:
+        st = self.sections.get(section_id)
+        if not st:
+            return []
+
+        info = self.realtime_map.section_info(section_id, st)
+        speed = "n/a" if st.marker_speed_mps is None else f"{st.marker_speed_mps:.2f} m/s"
+        distance = "-" if st.marker_distance_m is None else f"{st.marker_distance_m:.2f} m"
+        raw_distance = "-" if st.marker_distance_raw_m is None else f"{st.marker_distance_raw_m:.2f} m"
+        fps = "-" if st.video_fps <= 0 else f"{st.video_fps:.1f}"
+
+        parts: list[tuple[str, str]] = [
+            ("Live\n", "title"),
+            (f"Video FPS: {fps}\n", ""),
+            (f"Marker: {st.marker_id or '-'}\n", ""),
+            (f"Distance: {distance}  raw {raw_distance}\n", ""),
+            (f"Power: {st.power}\n", ""),
+            (f"Speed: {speed}\n", ""),
+        ]
+
+        status = info.get("status")
+        if status == "mapped":
+            next_distance = info.get("next_point_distance_cm")
+            next_text = "-" if next_distance is None else f"{next_distance:.1f} cm"
+            parts.extend([
+                (f"Section: {info['section_no']} {info['section_label']}\n", ""),
+                (f"Direction: {info['branch']}\n", ""),
+                (f"Position: x={info['x_mm']:.0f} y={info['y_mm']:.0f} mm\n", ""),
+                (f"Next point: {next_text}\n", ""),
+                (f"Control points ({info['branch']}):\n", "title"),
+            ])
+            points = info.get("control_points", [])
+            interval_indexes = info.get("interval_indexes", set())
+            if points:
+                for idx, point in enumerate(points):
+                    distance_cm = self.realtime_map._point_distance(point)
+                    action_type = point.get("action_type", point.get("type", "power"))
+                    value = point.get("value", point.get("power", ""))
+                    timeout = point.get("timeout_s", 0)
+                    prefix = ">>" if idx in interval_indexes else "  "
+                    tag = "interval" if idx in interval_indexes else ""
+                    parts.append((f"{prefix} {distance_cm:5.1f}cm {action_type:<7} v={value} t={timeout}\n", tag))
+            else:
+                parts.append(("Control points: -\n", "muted"))
+        elif status == "unmapped":
+            ids = ", ".join(str(mid) for mid in info.get("map_sign_ids", [])) or "-"
+            parts.extend([
+                ("Marker is visible, but it is not placed on the current map.\n", "warn"),
+                (f"Map sign IDs: {ids}\n", "muted"),
+            ])
+        elif status == "stale":
+            parts.append(("Marker data is stale.\n", "muted"))
+        else:
+            ids = ", ".join(str(mid) for mid in info.get("map_sign_ids", [])) or "-"
+            parts.extend([
+                ("Waiting for marker_seen...\n", "muted"),
+                (f"Map sign IDs: {ids}\n", "muted"),
+            ])
+
+        return parts
+
     def _on_canvas_configure(self, event):
         self.canvas.itemconfigure(self.inner_window, width=event.width)
         self._layout_sections(event.width)
@@ -580,9 +1252,6 @@ class TrainGuiApp:
         return 1
 
     def _layout_sections(self, available_width: int | None = None):
-        if not self.widgets:
-            return
-
         if available_width is None:
             available_width = max(1, self.canvas.winfo_width())
 
@@ -610,6 +1279,19 @@ class TrainGuiApp:
 
         for row in range(max(self._layout_row_count, row_count)):
             self.inner.grid_rowconfigure(row, weight=1 if row < row_count else 0)
+        viewport_h = max(1, self.canvas.winfo_height())
+        train_rows_h = row_count * (VIDEO_CANVAS_HEIGHT + 95)
+        map_h = max(REALTIME_MAP_HEIGHT, viewport_h - train_rows_h - 60)
+        self.realtime_map.canvas.configure(height=map_h)
+        self.realtime_map.frame.grid(
+            row=row_count,
+            column=0,
+            columnspan=columns,
+            sticky="nsew",
+            padx=SECTION_GRID_PAD_X,
+            pady=(SECTION_GRID_PAD_Y, SECTION_GRID_PAD_Y + 8),
+        )
+        self.inner.grid_rowconfigure(row_count, weight=1)
         self._layout_row_count = row_count
 
     def _layout_diagnostics(self):
@@ -634,6 +1316,7 @@ class TrainGuiApp:
     def _layout_all_sections(self):
         self._layout_sections()
         self._layout_diagnostics()
+        self.realtime_map.set_trains(self.sections)
 
     def _ensure_section_by_train(self, train_id: str) -> TrainSectionState:
         if train_id not in self.sections:
@@ -661,6 +1344,7 @@ class TrainGuiApp:
     def _refresh_section(self, section_id: str):
         if section_id in self.sections and section_id in self.widgets:
             self.widgets[section_id].set_state(self.sections[section_id])
+            self.widgets[section_id].set_live_info(self._dashboard_info_parts(section_id))
             self._layout_all_sections()
 
     def _remove_section(self, section_id: str):
@@ -874,6 +1558,11 @@ class TrainGuiApp:
             return
 
         st.video_mtime_ns = mtime_ns
+        now = time.monotonic()
+        if st.video_last_frame_s > 0 and now > st.video_last_frame_s:
+            instant_fps = 1.0 / max(0.001, now - st.video_last_frame_s)
+            st.video_fps = instant_fps if st.video_fps <= 0 else (st.video_fps * 0.8 + instant_fps * 0.2)
+        st.video_last_frame_s = now
         widget.set_video_photo(photo)
 
     def handle_event(self, evt: dict):
@@ -963,11 +1652,38 @@ class TrainGuiApp:
 
             st = self.sections.get(section_id)
             if st:
+                prev_marker_id = st.marker_id
+                prev_distance_m = st.marker_distance_m
+                prev_seen = st.marker_last_seen
+                now = time.monotonic()
+
                 st.marker_id = str(data.get("marker_id", ""))
                 try:
-                    st.marker_distance_m = float(data.get("distance_m"))
+                    distance_m = float(data.get("distance_m"))
+                    st.marker_distance_m = distance_m
                 except (TypeError, ValueError):
+                    distance_m = None
                     st.marker_distance_m = None
+
+                if (
+                    distance_m is not None
+                    and prev_distance_m is not None
+                    and prev_marker_id == st.marker_id
+                    and prev_seen > 0
+                    and now > prev_seen
+                ):
+                    delta_m = distance_m - prev_distance_m
+                    dt_s = now - prev_seen
+                    st.marker_speed_mps = abs(delta_m) / dt_s
+                    if delta_m < -0.002:
+                        st.marker_branch = "approach"
+                    elif delta_m > 0.002:
+                        st.marker_branch = "retreat"
+                else:
+                    st.marker_speed_mps = None
+                    if prev_marker_id != st.marker_id or not st.marker_branch:
+                        st.marker_branch = "approach"
+
                 try:
                     st.marker_distance_raw_m = float(data.get("distance_raw_m"))
                 except (TypeError, ValueError):
@@ -977,7 +1693,7 @@ class TrainGuiApp:
                 except (TypeError, ValueError):
                     st.marker_area_px = None
                 st.marker_dict = str(data.get("dict", ""))
-                st.marker_last_seen = time.monotonic()
+                st.marker_last_seen = now
                 self._refresh_section(section_id)
 
     def _poll_events(self):
@@ -1008,6 +1724,7 @@ class TrainGuiApp:
             if st.removable:
                 self._remove_section(section_id)
 
+        self.realtime_map.refresh()
         self.root.after(1000, self._housekeeping)
 
 
