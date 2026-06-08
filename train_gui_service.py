@@ -25,7 +25,7 @@ DEFAULT_FOTA_BIN_PATH = os.path.abspath(
 POWER_STEP = 20
 POWER_MIN = -100
 POWER_MAX = 100
-VIDEO_POLL_MS = 20
+VIDEO_POLL_MS = 10
 VIDEO_CANVAS_WIDTH = 640
 VIDEO_CANVAS_HEIGHT = 480
 INITIAL_WINDOW_WIDTH = 1600
@@ -38,8 +38,10 @@ SECTION_MAX_COLUMNS = 2
 SECTION_GRID_PAD_X = 8
 SECTION_GRID_PAD_Y = 6
 REALTIME_MAP_HEIGHT = 360
-REALTIME_MAP_PADDING_PX = 28
+REALTIME_MAP_PADDING_PX = 14
 REALTIME_MAP_RELOAD_INTERVAL_S = 1.0
+REALTIME_MAP_REDRAW_INTERVAL_S = 0.2
+LIVE_INFO_UPDATE_INTERVAL_S = 0.25
 TRAIN_MARKER_STALE_S = 8.0
 
 
@@ -172,26 +174,28 @@ class RealtimeRailwayView:
         self.markers_by_id: dict[int, dict] = {}
         self.last_mtime = 0.0
         self.last_reload_s = 0.0
+        self.last_redraw_s = 0.0
         self.trains: dict[str, TrainSectionState] = {}
 
     def set_trains(self, trains: dict[str, TrainSectionState]):
         self.trains = trains
+
+    def refresh(self, force: bool = False):
+        now = time.monotonic()
+        if not force and now - self.last_redraw_s < REALTIME_MAP_REDRAW_INTERVAL_S:
+            return
         self.redraw()
 
-    def refresh(self):
-        self._load_if_needed()
-        self.redraw()
+    def _load_if_needed(self, force: bool = False):
+        now = time.monotonic()
+        if not force and now - self.last_reload_s < REALTIME_MAP_RELOAD_INTERVAL_S:
+            return
+        self.last_reload_s = now
 
-    def _load_if_needed(self):
         if self.map_provider:
             data = self.map_provider()
             self._apply_map_data(data)
             return
-
-        now = time.monotonic()
-        if now - self.last_reload_s < REALTIME_MAP_RELOAD_INTERVAL_S:
-            return
-        self.last_reload_s = now
 
         try:
             mtime = os.path.getmtime(MAP_CONFIG_PATH)
@@ -226,6 +230,7 @@ class RealtimeRailwayView:
 
     def redraw(self):
         self._load_if_needed()
+        self.last_redraw_s = time.monotonic()
         self.canvas.delete("all")
 
         w = max(1, self.canvas.winfo_width())
@@ -241,7 +246,7 @@ class RealtimeRailwayView:
             return
 
         train_positions = self._train_positions()
-        bounds = self._bounds(train_positions)
+        bounds = self._bounds()
         if not bounds:
             return
 
@@ -476,7 +481,7 @@ class RealtimeRailwayView:
         proj_y = y1 + dy * t
         return math.hypot(x_mm - proj_x, y_mm - proj_y)
 
-    def _bounds(self, train_positions: dict[str, dict]) -> tuple[float, float, float, float] | None:
+    def _bounds(self) -> tuple[float, float, float, float] | None:
         points: list[tuple[float, float]] = []
         for elem in self.elements:
             points.extend(self._element_points(elem))
@@ -485,14 +490,12 @@ class RealtimeRailwayView:
                 points.append((float(marker.get("x_mm", marker.get("x", 0))), float(marker.get("y_mm", marker.get("y", 0)))))
             except (TypeError, ValueError):
                 continue
-        for pos in train_positions.values():
-            points.append((pos["x_mm"], pos["y_mm"]))
         if not points:
             return None
-        min_x = min(p[0] for p in points) - 160
-        max_x = max(p[0] for p in points) + 160
-        min_y = min(p[1] for p in points) - 160
-        max_y = max(p[1] for p in points) + 160
+        min_x = min(p[0] for p in points) - 64
+        max_x = max(p[0] for p in points) + 64
+        min_y = min(p[1] for p in points) - 64
+        max_y = max(p[1] for p in points) + 64
         return min_x, min_y, max_x, max_y
 
     def _element_points(self, elem: dict) -> list[tuple[float, float]]:
@@ -730,13 +733,15 @@ class TrainSectionWidget:
         dashboard_body.pack(fill="both", expand=True, padx=8, pady=8)
         dashboard_body.columnconfigure(0, weight=0)
         dashboard_body.columnconfigure(1, weight=1)
-        dashboard_body.rowconfigure(0, weight=1)
+        dashboard_body.rowconfigure(0, weight=0)
 
         self.video_wrap = ttk.Frame(dashboard_body)
         self.video_wrap.grid(row=0, column=0, sticky="nw")
 
         self.side_wrap = ttk.Frame(dashboard_body)
-        self.side_wrap.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+        self.side_wrap.grid(row=0, column=1, sticky="new", padx=(10, 0))
+        self.side_wrap.configure(height=VIDEO_CANVAS_HEIGHT)
+        self.side_wrap.grid_propagate(False)
         self.side_wrap.columnconfigure(0, weight=1)
 
         status = ttk.Frame(self.side_wrap)
@@ -805,16 +810,37 @@ class TrainSectionWidget:
         )
         self.btn_fwd.pack(side="left", padx=4)
 
-        self.live_info = tk.Text(self.side_wrap, height=22, width=46, wrap="word", borderwidth=1, relief="solid")
-        self.live_info.grid(row=2, column=0, sticky="nsew")
+        self.live_wrap = ttk.Frame(self.side_wrap)
+        self.live_wrap.grid(row=2, column=0, sticky="nsew")
+        self.live_wrap.columnconfigure(0, weight=1)
+        self.live_wrap.columnconfigure(1, weight=1)
+        self.live_wrap.rowconfigure(0, weight=1)
         self.side_wrap.rowconfigure(2, weight=1)
-        self.live_info.configure(state="disabled")
-        self.live_info.tag_configure("title", font=("Arial", 10, "bold"))
-        self.live_info.tag_configure("muted", foreground="#606060")
-        self.live_info.tag_configure("interval", background="#fff2a8")
-        self.live_info.tag_configure("warn", foreground="#a55d00")
+
+        self.live_info = self._make_live_text(self.live_wrap)
+        self.live_info.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        self.live_points = self._make_live_text(self.live_wrap)
+        self.live_points.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
 
         self._build_diagnostics()
+
+    def _make_live_text(self, parent):
+        text = tk.Text(
+            parent,
+            width=32,
+            wrap="none",
+            borderwidth=1,
+            relief="solid",
+            font=("TkFixedFont", 8),
+            padx=2,
+            pady=2,
+        )
+        text.configure(state="disabled")
+        text.tag_configure("title", font=("TkDefaultFont", 8, "bold"))
+        text.tag_configure("muted", foreground="#606060")
+        text.tag_configure("interval", background="#fff2a8")
+        text.tag_configure("warn", foreground="#a55d00")
+        return text
 
     def _build_diagnostics(self):
         info = ttk.Frame(self.diagnostics_frame)
@@ -965,12 +991,17 @@ class TrainSectionWidget:
         self.term.see("end")
         self.term.configure(state="disabled")
 
-    def set_live_info(self, parts: list[tuple[str, str]]):
-        self.live_info.configure(state="normal")
-        self.live_info.delete("1.0", "end")
+    def set_live_info(self, parts: tuple[list[tuple[str, str]], list[tuple[str, str]]]):
+        summary, points = parts
+        self._write_live_text(self.live_info, summary)
+        self._write_live_text(self.live_points, points)
+
+    def _write_live_text(self, widget: tk.Text, parts: list[tuple[str, str]]):
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
         for text, tag in parts:
-            self.live_info.insert("end", text, tag or None)
-        self.live_info.configure(state="disabled")
+            widget.insert("end", text, tag or None)
+        widget.configure(state="disabled")
 
     def set_video_photo(self, photo: tk.PhotoImage):
         self.video_photo = photo
@@ -1076,6 +1107,7 @@ class TrainGuiApp:
         self._seq = 0
         self._layout_row_count = 0
         self._diagnostics_row_count = 0
+        self._last_live_info_s: dict[str, float] = {}
         self.ws_console_log_dir = os.path.join(os.path.dirname(__file__), "tmp")
 
         self.notebook = ttk.Notebook(root)
@@ -1175,10 +1207,10 @@ class TrainGuiApp:
             "markers": [asdict(m) for m in self.map_tab.map.markers],
         }
 
-    def _dashboard_info_parts(self, section_id: str) -> list[tuple[str, str]]:
+    def _dashboard_info_parts(self, section_id: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
         st = self.sections.get(section_id)
         if not st:
-            return []
+            return [], []
 
         info = self.realtime_map.section_info(section_id, st)
         speed = "n/a" if st.marker_speed_mps is None else f"{st.marker_speed_mps:.2f} m/s"
@@ -1186,7 +1218,7 @@ class TrainGuiApp:
         raw_distance = "-" if st.marker_distance_raw_m is None else f"{st.marker_distance_raw_m:.2f} m"
         fps = "-" if st.video_fps <= 0 else f"{st.video_fps:.1f}"
 
-        parts: list[tuple[str, str]] = [
+        summary: list[tuple[str, str]] = [
             ("Live\n", "title"),
             (f"Video FPS: {fps}\n", ""),
             (f"Marker: {st.marker_id or '-'}\n", ""),
@@ -1194,18 +1226,19 @@ class TrainGuiApp:
             (f"Power: {st.power}\n", ""),
             (f"Speed: {speed}\n", ""),
         ]
+        points_parts: list[tuple[str, str]] = [("Control points\n", "title")]
 
         status = info.get("status")
         if status == "mapped":
             next_distance = info.get("next_point_distance_cm")
             next_text = "-" if next_distance is None else f"{next_distance:.1f} cm"
-            parts.extend([
+            summary.extend([
                 (f"Section: {info['section_no']} {info['section_label']}\n", ""),
                 (f"Direction: {info['branch']}\n", ""),
                 (f"Position: x={info['x_mm']:.0f} y={info['y_mm']:.0f} mm\n", ""),
                 (f"Next point: {next_text}\n", ""),
-                (f"Control points ({info['branch']}):\n", "title"),
             ])
+            points_parts.append((f"{info['branch']}\n", "muted"))
             points = info.get("control_points", [])
             interval_indexes = info.get("interval_indexes", set())
             if points:
@@ -1216,25 +1249,28 @@ class TrainGuiApp:
                     timeout = point.get("timeout_s", 0)
                     prefix = ">>" if idx in interval_indexes else "  "
                     tag = "interval" if idx in interval_indexes else ""
-                    parts.append((f"{prefix} {distance_cm:5.1f}cm {action_type:<7} v={value} t={timeout}\n", tag))
+                    points_parts.append((f"{prefix} {distance_cm:5.1f}cm {str(action_type)[:5]:<5} v={value} t={timeout}\n", tag))
             else:
-                parts.append(("Control points: -\n", "muted"))
+                points_parts.append(("-\n", "muted"))
         elif status == "unmapped":
             ids = ", ".join(str(mid) for mid in info.get("map_sign_ids", [])) or "-"
-            parts.extend([
+            summary.extend([
                 ("Marker is visible, but it is not placed on the current map.\n", "warn"),
                 (f"Map sign IDs: {ids}\n", "muted"),
             ])
+            points_parts.append(("-\n", "muted"))
         elif status == "stale":
-            parts.append(("Marker data is stale.\n", "muted"))
+            summary.append(("Marker data is stale.\n", "muted"))
+            points_parts.append(("-\n", "muted"))
         else:
             ids = ", ".join(str(mid) for mid in info.get("map_sign_ids", [])) or "-"
-            parts.extend([
+            summary.extend([
                 ("Waiting for marker_seen...\n", "muted"),
                 (f"Map sign IDs: {ids}\n", "muted"),
             ])
+            points_parts.append(("-\n", "muted"))
 
-        return parts
+        return summary, points_parts
 
     def _on_canvas_configure(self, event):
         self.canvas.itemconfigure(self.inner_window, width=event.width)
@@ -1272,16 +1308,16 @@ class TrainGuiApp:
             self.widgets[section_id].frame.grid(
                 row=row,
                 column=col,
-                sticky="nsew",
+                sticky="new",
                 padx=SECTION_GRID_PAD_X,
                 pady=SECTION_GRID_PAD_Y,
             )
 
         for row in range(max(self._layout_row_count, row_count)):
-            self.inner.grid_rowconfigure(row, weight=1 if row < row_count else 0)
+            self.inner.grid_rowconfigure(row, weight=0)
         viewport_h = max(1, self.canvas.winfo_height())
-        train_rows_h = row_count * (VIDEO_CANVAS_HEIGHT + 95)
-        map_h = max(REALTIME_MAP_HEIGHT, viewport_h - train_rows_h - 60)
+        train_rows_h = row_count * (VIDEO_CANVAS_HEIGHT + 52)
+        map_h = max(260, viewport_h - train_rows_h - 46)
         self.realtime_map.canvas.configure(height=map_h)
         self.realtime_map.frame.grid(
             row=row_count,
@@ -1341,11 +1377,17 @@ class TrainGuiApp:
         self._refresh_section(section_id)
         return self.sections[section_id]
 
-    def _refresh_section(self, section_id: str):
+    def _refresh_section(self, section_id: str, layout: bool = True, refresh_map: bool = False):
         if section_id in self.sections and section_id in self.widgets:
             self.widgets[section_id].set_state(self.sections[section_id])
-            self.widgets[section_id].set_live_info(self._dashboard_info_parts(section_id))
-            self._layout_all_sections()
+            now = time.monotonic()
+            if layout or now - self._last_live_info_s.get(section_id, 0.0) >= LIVE_INFO_UPDATE_INTERVAL_S:
+                self.widgets[section_id].set_live_info(self._dashboard_info_parts(section_id))
+                self._last_live_info_s[section_id] = now
+            if layout:
+                self._layout_all_sections()
+            if refresh_map:
+                self.realtime_map.refresh()
 
     def _remove_section(self, section_id: str):
         st = self.sections.get(section_id)
@@ -1640,7 +1682,7 @@ class TrainGuiApp:
                 if "power" in data:
                     st.power = clamp_power(int(data.get("power", st.power)))
                 st.lego_last_seen = time.monotonic()
-                self._refresh_section(train_id)
+                self._refresh_section(train_id, layout=False, refresh_map=True)
 
         elif etype == "marker_seen":
             train_id = data.get("train_id", "")
@@ -1694,7 +1736,7 @@ class TrainGuiApp:
                     st.marker_area_px = None
                 st.marker_dict = str(data.get("dict", ""))
                 st.marker_last_seen = now
-                self._refresh_section(section_id)
+                self._refresh_section(section_id, layout=False, refresh_map=True)
 
     def _poll_events(self):
         try:
@@ -1719,7 +1761,7 @@ class TrainGuiApp:
                 continue
 
             self._read_terminal_updates(section_id)
-            self._refresh_section(section_id)
+            self._refresh_section(section_id, layout=False)
 
             if st.removable:
                 self._remove_section(section_id)
