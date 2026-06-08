@@ -458,29 +458,10 @@ def main():
                         frames = 0
                         last_stat = now
 
-                    # HUD (compact for 320x240)
-                    det_n = 0 if ids is None else len(ids)
-                    put(img, f"FPS {fps_print} det {det_n} rej {last_rej_n} {last_det_ms:.1f}ms", 5, 16, 0.45)
-                    if show_window:
-                        put(img, f"Click window; press C to calib @ {calib_dist:.2f}m", 5, 34, 0.45)
-                    else:
-                        put(img, f"calib_dist {calib_dist:.2f}m (window disabled)", 5, 34, 0.45)
-                    put(img, f"k_area {k_area:.3f} dict {dict_name}", 5, 52, 0.45)
-
-                    if last_best_id is None:
-                        put(img, "Best: -", 5, 70, 0.50)
-                    else:
-                        df = "inf" if dist_f is None or not np.isfinite(dist_f) else f"{dist_f:.2f}m"
-                        dr = "inf" if not np.isfinite(last_best_dist) else f"{last_best_dist:.2f}m"
-                        put(img, f"Best ID {last_best_id} area {last_best_area:.0f}px", 5, 70, 0.50)
-                        put(img, f"dist raw {dr} filt {df}", 5, 88, 0.50)
-
-                    s = asm.stats
-                    put(img, f"drop t/o {s.dropped_timeout} repl {s.dropped_replaced} old {s.dropped_old}", 5, 106, 0.42)
-                    if show_window:
-                        put(img, f"TH <{th_approach:.2f}/{th_brake:.2f}/{th_stop:.2f}m ESC/q exit", 5, 124, 0.42)
-                    else:
-                        put(img, f"TH <{th_approach:.2f}/{th_brake:.2f}/{th_stop:.2f}m embedded", 5, 124, 0.42)
+                    # Minimal HUD for the dashboard snapshot. Detailed telemetry is shown in GUI Console.
+                    put(img, f"FPS {fps_print}", 5, 16, 0.45)
+                    df = "-" if best is None or dist_f is None or not np.isfinite(dist_f) else f"{dist_f:.2f}m"
+                    put(img, f"distance {df}", 5, 34, 0.45)
 
                     if snapshot_writer:
                         snapshot_writer.write(img)

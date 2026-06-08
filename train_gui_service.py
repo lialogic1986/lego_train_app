@@ -69,6 +69,12 @@ class TrainSectionState:
     terminal_offset: int = 0
     video_path: str = ""
     video_mtime_ns: int = 0
+    marker_id: str = ""
+    marker_distance_m: float | None = None
+    marker_distance_raw_m: float | None = None
+    marker_area_px: float | None = None
+    marker_dict: str = ""
+    marker_last_seen: float = 0.0
 
     @property
     def title(self) -> str:
@@ -135,11 +141,12 @@ class BusWorker:
 
 
 class TrainSectionWidget:
-    def __init__(self, parent, send_cb):
+    def __init__(self, dashboard_parent, diagnostics_parent, send_cb):
         self.send_cb = send_cb
         self.state: TrainSectionState | None = None
 
-        self.frame = ttk.LabelFrame(parent, text="Train")
+        self.frame = ttk.LabelFrame(dashboard_parent, text="Train")
+        self.diagnostics_frame = ttk.LabelFrame(diagnostics_parent, text="Train diagnostics")
 
         status = ttk.Frame(self.frame)
         status.pack(fill="x", padx=8, pady=(8, 4))
@@ -160,21 +167,6 @@ class TrainSectionWidget:
 
         self.power_var = tk.StringVar(value="power: 0")
         ttk.Label(status, textvariable=self.power_var).grid(row=0, column=6, padx=(20, 0), sticky="w")
-
-        info = ttk.Frame(self.frame)
-        info.pack(fill="x", padx=8, pady=(0, 4))
-
-        self.train_id_var = tk.StringVar(value="train_id: -")
-        self.lego_id_var = tk.StringVar(value="lego_id: -")
-        self.camera_id_var = tk.StringVar(value="camera_id: -")
-        self.camera_device_var = tk.StringVar(value="device_id: -")
-        self.camera_fw_var = tk.StringVar(value="fw: -")
-
-        ttk.Label(info, textvariable=self.train_id_var).pack(anchor="w")
-        ttk.Label(info, textvariable=self.lego_id_var).pack(anchor="w")
-        ttk.Label(info, textvariable=self.camera_id_var).pack(anchor="w")
-        ttk.Label(info, textvariable=self.camera_device_var).pack(anchor="w")
-        ttk.Label(info, textvariable=self.camera_fw_var).pack(anchor="w")
 
         self.video_wrap = ttk.Frame(self.frame)
         self.video_wrap.pack(fill="x", padx=8, pady=(2, 6))
@@ -225,15 +217,42 @@ class TrainSectionWidget:
         )
         self.btn_fwd.pack(side="left", padx=4)
 
+        self._build_diagnostics()
+
+    def _build_diagnostics(self):
+        info = ttk.Frame(self.diagnostics_frame)
+        info.pack(fill="x", padx=8, pady=(8, 4))
+
+        self.train_id_var = tk.StringVar(value="train_id: -")
+        self.lego_id_var = tk.StringVar(value="lego_id: -")
+        self.camera_id_var = tk.StringVar(value="camera_id: -")
+        self.camera_device_var = tk.StringVar(value="device_id: -")
+        self.camera_fw_var = tk.StringVar(value="fw: -")
+        self.marker_info_var = tk.StringVar(value="marker: -")
+
+        for var in (
+            self.train_id_var,
+            self.lego_id_var,
+            self.camera_id_var,
+            self.camera_device_var,
+            self.camera_fw_var,
+            self.marker_info_var,
+            self.power_var,
+        ):
+            ttk.Label(info, textvariable=var).pack(anchor="w")
+
+        fota_row = ttk.Frame(self.diagnostics_frame)
+        fota_row.pack(fill="x", padx=8, pady=(4, 8))
+
         self.btn_fota = ttk.Button(
-            controls,
+            fota_row,
             text="FOTA...",
             command=self._on_fota,
             state="disabled",
         )
-        self.btn_fota.pack(side="left", padx=(18, 4))
+        self.btn_fota.pack(side="left")
 
-        term_wrap = ttk.Frame(self.frame)
+        term_wrap = ttk.Frame(self.diagnostics_frame)
         term_wrap.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
         self.term_label = ttk.Label(term_wrap, text="Camera terminal")
@@ -256,6 +275,7 @@ class TrainSectionWidget:
 
     def destroy(self):
         self.frame.destroy()
+        self.diagnostics_frame.destroy()
 
     def _set_indicator(self, canvas: tk.Canvas, dot, online: bool, text_var: tk.StringVar):
         canvas.itemconfig(dot, fill=("green" if online else "red"))
@@ -326,7 +346,7 @@ class TrainSectionWidget:
         initial_file = os.path.basename(initial_path) if os.path.isfile(initial_path) else ""
 
         bin_path = filedialog.askopenfilename(
-            parent=self.frame,
+            parent=self.diagnostics_frame,
             title="Select firmware image",
             initialdir=initial_dir,
             initialfile=initial_file,
@@ -395,6 +415,16 @@ class TrainSectionWidget:
         self.camera_id_var.set(f"camera_id: {cam_info}")
         self.camera_device_var.set(f"device_id: {st.camera_device_id or '-'}")
         self.camera_fw_var.set(f"fw: {st.camera_fw or '-'}")
+        if st.marker_id:
+            dist = "-" if st.marker_distance_m is None else f"{st.marker_distance_m:.2f}m"
+            raw = "-" if st.marker_distance_raw_m is None else f"{st.marker_distance_raw_m:.2f}m"
+            area = "-" if st.marker_area_px is None else f"{st.marker_area_px:.0f}px"
+            marker_dict = st.marker_dict or "-"
+            self.marker_info_var.set(
+                f"marker: id={st.marker_id} dist={dist} raw={raw} area={area} dict={marker_dict}"
+            )
+        else:
+            self.marker_info_var.set("marker: -")
 
         self.power_var.set(f"power: {st.power}")
 
@@ -441,15 +471,18 @@ class TrainGuiApp:
 
         self._seq = 0
         self._layout_row_count = 0
+        self._diagnostics_row_count = 0
         self.ws_console_log_dir = os.path.join(os.path.dirname(__file__), "tmp")
 
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(fill="both", expand=True)
 
         self.main = ttk.Frame(self.notebook)
+        self.console_tab = ttk.Frame(self.notebook)
         self.map_tab = RailwayMapEditor(self.notebook)
 
         self.notebook.add(self.main, text="Dashboard")
+        self.notebook.add(self.console_tab, text="Console")
         self.notebook.add(self.map_tab, text="Railway Map")
 
         ttk.Label(
@@ -473,6 +506,22 @@ class TrainGuiApp:
 
         self.canvas.pack(side="left", fill="both", expand=True)
         self.scroll.pack(side="right", fill="y")
+
+        self.console_canvas = tk.Canvas(self.console_tab, highlightthickness=0)
+        self.console_scroll = ttk.Scrollbar(self.console_tab, orient="vertical", command=self.console_canvas.yview)
+        self.console_inner = ttk.Frame(self.console_canvas)
+
+        self.console_inner.bind(
+            "<Configure>",
+            lambda e: self.console_canvas.configure(scrollregion=self.console_canvas.bbox("all"))
+        )
+
+        self.console_inner_window = self.console_canvas.create_window((0, 0), window=self.console_inner, anchor="nw")
+        self.console_canvas.configure(yscrollcommand=self.console_scroll.set)
+        self.console_canvas.bind("<Configure>", self._on_console_canvas_configure)
+
+        self.console_canvas.pack(side="left", fill="both", expand=True)
+        self.console_scroll.pack(side="right", fill="y")
 
     def _on_close(self):
         if self._closing:
@@ -519,6 +568,10 @@ class TrainGuiApp:
         self.canvas.itemconfigure(self.inner_window, width=event.width)
         self._layout_sections(event.width)
 
+    def _on_console_canvas_configure(self, event):
+        self.console_canvas.itemconfigure(self.console_inner_window, width=event.width)
+        self._layout_diagnostics()
+
     def _section_columns(self, available_width: int) -> int:
         if len(self.widgets) <= 1:
             return 1
@@ -559,11 +612,34 @@ class TrainGuiApp:
             self.inner.grid_rowconfigure(row, weight=1 if row < row_count else 0)
         self._layout_row_count = row_count
 
+    def _layout_diagnostics(self):
+        if not self.widgets:
+            return
+
+        self.console_inner.grid_columnconfigure(0, weight=1)
+        section_ids = [sid for sid in self.sections.keys() if sid in self.widgets]
+        for idx, section_id in enumerate(section_ids):
+            self.widgets[section_id].diagnostics_frame.grid(
+                row=idx,
+                column=0,
+                sticky="nsew",
+                padx=SECTION_GRID_PAD_X,
+                pady=SECTION_GRID_PAD_Y,
+            )
+
+        for row in range(max(self._diagnostics_row_count, len(section_ids))):
+            self.console_inner.grid_rowconfigure(row, weight=1 if row < len(section_ids) else 0)
+        self._diagnostics_row_count = len(section_ids)
+
+    def _layout_all_sections(self):
+        self._layout_sections()
+        self._layout_diagnostics()
+
     def _ensure_section_by_train(self, train_id: str) -> TrainSectionState:
         if train_id not in self.sections:
             self.sections[train_id] = TrainSectionState(section_id=train_id, train_id=train_id)
         if train_id not in self.widgets:
-            self.widgets[train_id] = TrainSectionWidget(self.inner, self.bus.emit)
+            self.widgets[train_id] = TrainSectionWidget(self.inner, self.console_inner, self.bus.emit)
         self._refresh_section(train_id)
         return self.sections[train_id]
 
@@ -575,7 +651,7 @@ class TrainGuiApp:
 
         section_id = self._alloc_section_id()
         self.sections[section_id] = TrainSectionState(section_id=section_id, camera_id=camera_id)
-        self.widgets[section_id] = TrainSectionWidget(self.inner, self.bus.emit)
+        self.widgets[section_id] = TrainSectionWidget(self.inner, self.console_inner, self.bus.emit)
         self.camera_to_section[camera_id] = section_id
         self.sections[section_id].terminal_path = self._default_terminal_path(camera_id)
         self.sections[section_id].video_path = self._default_video_path(camera_id)
@@ -585,7 +661,7 @@ class TrainGuiApp:
     def _refresh_section(self, section_id: str):
         if section_id in self.sections and section_id in self.widgets:
             self.widgets[section_id].set_state(self.sections[section_id])
-            self._layout_sections()
+            self._layout_all_sections()
 
     def _remove_section(self, section_id: str):
         st = self.sections.get(section_id)
@@ -601,7 +677,7 @@ class TrainGuiApp:
             self.widgets[section_id].destroy()
             del self.widgets[section_id]
         del self.sections[section_id]
-        self._layout_sections()
+        self._layout_all_sections()
 
     def _merge_section_into_train(
         self,
@@ -876,6 +952,33 @@ class TrainGuiApp:
                     st.power = clamp_power(int(data.get("power", st.power)))
                 st.lego_last_seen = time.monotonic()
                 self._refresh_section(train_id)
+
+        elif etype == "marker_seen":
+            train_id = data.get("train_id", "")
+            camera_id = data.get("camera_id", "")
+            section_id = train_id if train_id in self.sections else self.camera_to_section.get(camera_id, "")
+            if not section_id and camera_id:
+                st = self._ensure_section_by_camera(camera_id)
+                section_id = st.section_id
+
+            st = self.sections.get(section_id)
+            if st:
+                st.marker_id = str(data.get("marker_id", ""))
+                try:
+                    st.marker_distance_m = float(data.get("distance_m"))
+                except (TypeError, ValueError):
+                    st.marker_distance_m = None
+                try:
+                    st.marker_distance_raw_m = float(data.get("distance_raw_m"))
+                except (TypeError, ValueError):
+                    st.marker_distance_raw_m = None
+                try:
+                    st.marker_area_px = float(data.get("area_px"))
+                except (TypeError, ValueError):
+                    st.marker_area_px = None
+                st.marker_dict = str(data.get("dict", ""))
+                st.marker_last_seen = time.monotonic()
+                self._refresh_section(section_id)
 
     def _poll_events(self):
         try:
