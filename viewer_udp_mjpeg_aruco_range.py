@@ -1,13 +1,16 @@
 import argparse
+import asyncio
 import os
 import socket
 import struct
+import threading
 import time
 from dataclasses import dataclass
 
 import numpy as np
 import cv2
 
+from event_client import EventClient
 from host_config import load_config, save_config, get_path, set_path
 
 
@@ -227,6 +230,49 @@ def put(img, text, x, y, s=0.45):
                 (255, 255, 255), 1, cv2.LINE_AA)
 
 
+class AsyncBusEmitter:
+    def __init__(self, client_id: str):
+        self.client_id = client_id
+        self.loop = None
+        self.queue = None
+        self.thread = None
+        self.ready = threading.Event()
+        self.closing = False
+
+    def start(self):
+        self.thread = threading.Thread(target=self._thread_main, daemon=True)
+        self.thread.start()
+        self.ready.wait(timeout=2.0)
+
+    def _thread_main(self):
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        self.queue = asyncio.Queue(maxsize=32)
+        self.ready.set()
+        self.loop.run_until_complete(self._main())
+
+    async def _main(self):
+        client = EventClient(self.client_id)
+        await client.connect()
+        while not self.closing:
+            etype, data = await self.queue.get()
+            try:
+                await client.emit(etype, data)
+            except Exception as e:
+                print(f"[{self.client_id}] emit failed: {e}", flush=True)
+
+    def emit(self, etype: str, data: dict):
+        if not self.loop or not self.queue:
+            return
+
+        def _put():
+            try:
+                self.queue.put_nowait((etype, data))
+            except asyncio.QueueFull:
+                pass
+
+        self.loop.call_soon_threadsafe(_put)
+
 
 def main():
     ap = argparse.ArgumentParser(description="UDP MJPEG (MJ framing) + ArUco + distance via marker area + shared JSON config")
@@ -242,6 +288,8 @@ def main():
     ap.add_argument("--no-window", action="store_true", help="Do not open an OpenCV window")
     ap.add_argument("--snapshot-path", default="", help="Write the latest annotated frame as JPEG")
     ap.add_argument("--snapshot-fps", type=float, default=10.0, help="Max snapshot writes per second")
+    ap.add_argument("--camera-id", default="", help="Logical camera_id for event_bus marker events")
+    ap.add_argument("--marker-event-fps", type=float, default=10.0, help="Max ArUco marker events per second")
     ap.add_argument("--calib-dist", type=float, default=None)
     ap.add_argument("--ema", type=float, default=None)
     ap.add_argument("--cooldown", type=float, default=None)
@@ -277,6 +325,11 @@ def main():
     detector = make_aruco_detector(dict_name)
     snapshot_writer = SnapshotWriter(args.snapshot_path, fps=args.snapshot_fps) if args.snapshot_path else None
     show_window = not args.no_window
+    marker_event_interval_s = 1.0 / max(0.1, float(args.marker_event_fps))
+    bus = None
+    if args.camera_id:
+        bus = AsyncBusEmitter(f"viewer.{args.camera_id}")
+        bus.start()
 
     source_ip_filter = (source_ip or "").strip() or None
 
@@ -301,6 +354,7 @@ def main():
     dist_f = None
 
     last_event_ts = {"APPROACH": 0.0, "BRAKE": 0.0, "STOP": 0.0}
+    last_marker_emit_ts = {}
 
     last_det_ms = 0.0
     last_rej_n = 0
@@ -370,6 +424,22 @@ def main():
 
                         now = now_s()
                         if dist_f is not None and np.isfinite(dist_f):
+                            last_emit = last_marker_emit_ts.get(mid, 0.0)
+                            if bus and (now - last_emit) >= marker_event_interval_s:
+                                last_marker_emit_ts[mid] = now
+                                bus.emit(
+                                    "marker_seen",
+                                    {
+                                        "camera_id": args.camera_id,
+                                        "marker_id": mid,
+                                        "distance_m": float(dist_f),
+                                        "distance_raw_m": float(dist_raw),
+                                        "area_px": float(area_px),
+                                        "dict": dict_name,
+                                        "ts_ms": int(time.time() * 1000),
+                                    },
+                                )
+
                             if dist_f < th_stop and (now - last_event_ts["STOP"]) >= cooldown_s:
                                 last_event_ts["STOP"] = now
                                 print(f"EVENT STOP: id={mid} dist={dist_f:.2f}m")

@@ -210,6 +210,7 @@ class ServiceManager:
             "--port", str(video_port),
             "--snapshot-path", str(video_snapshot),
             "--snapshot-fps", "50",
+            "--camera-id", camera_id,
             "--no-window",
         ]
 

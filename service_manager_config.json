@@ -5,6 +5,10 @@
       "argv": ["{python}", "ble_broker.py"]
     },
     {
+      "name": "railway_map_runtime",
+      "argv": ["{python}", "railway_map_runtime.py"]
+    },
+    {
       "name": "train_gui",
       "argv": ["{python}", "train_gui_service.py"]
     }

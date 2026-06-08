@@ -11,6 +11,7 @@ from tkinter import filedialog, ttk
 import cv2
 
 from event_client import EventClient
+from railway_map_editor import RailwayMapEditor
 
 
 MODULE_OFFLINE_TIMEOUT = 10.0
@@ -23,11 +24,17 @@ POWER_STEP = 20
 POWER_MIN = -100
 POWER_MAX = 100
 VIDEO_POLL_MS = 20
+VIDEO_CANVAS_WIDTH = 640
+VIDEO_CANVAS_HEIGHT = 480
 INITIAL_WINDOW_WIDTH = 1600
 INITIAL_WINDOW_HEIGHT = 1350
 MIN_WINDOW_WIDTH = 900
 MIN_WINDOW_HEIGHT = 760
 SCREEN_MARGIN = 80
+SECTION_WIDE_LAYOUT_MIN_WIDTH = 1250
+SECTION_MAX_COLUMNS = 2
+SECTION_GRID_PAD_X = 8
+SECTION_GRID_PAD_Y = 6
 
 
 def safe_filename_id(value: str) -> str:
@@ -133,7 +140,6 @@ class TrainSectionWidget:
         self.state: TrainSectionState | None = None
 
         self.frame = ttk.LabelFrame(parent, text="Train")
-        self.frame.pack(fill="x", padx=8, pady=6)
 
         status = ttk.Frame(self.frame)
         status.pack(fill="x", padx=8, pady=(8, 4))
@@ -170,13 +176,13 @@ class TrainSectionWidget:
         ttk.Label(info, textvariable=self.camera_device_var).pack(anchor="w")
         ttk.Label(info, textvariable=self.camera_fw_var).pack(anchor="w")
 
-        video_wrap = ttk.Frame(self.frame)
-        video_wrap.pack(fill="x", padx=8, pady=(2, 6))
+        self.video_wrap = ttk.Frame(self.frame)
+        self.video_wrap.pack(fill="x", padx=8, pady=(2, 6))
 
         self.video_canvas = tk.Canvas(
-            video_wrap,
-            width=640,
-            height=480,
+            self.video_wrap,
+            width=VIDEO_CANVAS_WIDTH,
+            height=VIDEO_CANVAS_HEIGHT,
             bg="black",
             highlightthickness=1,
             highlightbackground="#555",
@@ -185,8 +191,8 @@ class TrainSectionWidget:
         self.video_photo = None
         self.video_image_id = None
         self.video_text_id = self.video_canvas.create_text(
-            320,
-            240,
+            VIDEO_CANVAS_WIDTH // 2,
+            VIDEO_CANVAS_HEIGHT // 2,
             text="Camera offline",
             fill="#d8d8d8",
             font=("Arial", 14),
@@ -233,8 +239,8 @@ class TrainSectionWidget:
         self.term_label = ttk.Label(term_wrap, text="Camera terminal")
         self.term_label.pack(anchor="w")
 
-        self.term = tk.Text(term_wrap, height=10, width=120, wrap="word")
-        self.term.pack(fill="x", expand=True)
+        self.term = tk.Text(term_wrap, height=10, width=1, wrap="word")
+        self.term.pack(fill="both", expand=True)
         self.term.configure(state="disabled")
 
         input_row = ttk.Frame(term_wrap)
@@ -346,13 +352,18 @@ class TrainSectionWidget:
         self.video_photo = photo
         if self.video_image_id is None:
             self.video_image_id = self.video_canvas.create_image(
-                320,
-                240,
+                VIDEO_CANVAS_WIDTH // 2,
+                VIDEO_CANVAS_HEIGHT // 2,
                 image=self.video_photo,
                 anchor="center",
             )
         else:
             self.video_canvas.itemconfig(self.video_image_id, image=self.video_photo)
+            self.video_canvas.coords(
+                self.video_image_id,
+                VIDEO_CANVAS_WIDTH // 2,
+                VIDEO_CANVAS_HEIGHT // 2,
+            )
         self.video_canvas.itemconfig(self.video_text_id, text="")
 
     def clear_video(self, message: str):
@@ -360,6 +371,11 @@ class TrainSectionWidget:
         if self.video_image_id is not None:
             self.video_canvas.delete(self.video_image_id)
             self.video_image_id = None
+        self.video_canvas.coords(
+            self.video_text_id,
+            VIDEO_CANVAS_WIDTH // 2,
+            VIDEO_CANVAS_HEIGHT // 2,
+        )
         self.video_canvas.itemconfig(self.video_text_id, text=message)
 
     def set_state(self, st: TrainSectionState):
@@ -424,10 +440,17 @@ class TrainGuiApp:
         self.train_to_section: dict[str, str] = {}
 
         self._seq = 0
+        self._layout_row_count = 0
         self.ws_console_log_dir = os.path.join(os.path.dirname(__file__), "tmp")
 
-        self.main = ttk.Frame(root)
-        self.main.pack(fill="both", expand=True)
+        self.notebook = ttk.Notebook(root)
+        self.notebook.pack(fill="both", expand=True)
+
+        self.main = ttk.Frame(self.notebook)
+        self.map_tab = RailwayMapEditor(self.notebook)
+
+        self.notebook.add(self.main, text="Dashboard")
+        self.notebook.add(self.map_tab, text="Railway Map")
 
         ttk.Label(
             self.main,
@@ -444,8 +467,9 @@ class TrainGuiApp:
             lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
         )
 
-        self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.inner_window = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
         self.canvas.configure(yscrollcommand=self.scroll.set)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
 
         self.canvas.pack(side="left", fill="both", expand=True)
         self.scroll.pack(side="right", fill="y")
@@ -491,6 +515,50 @@ class TrainGuiApp:
         safe = safe_filename_id(camera_id)
         return os.path.join(self.ws_console_log_dir, f"video_{safe}.jpg")
 
+    def _on_canvas_configure(self, event):
+        self.canvas.itemconfigure(self.inner_window, width=event.width)
+        self._layout_sections(event.width)
+
+    def _section_columns(self, available_width: int) -> int:
+        if len(self.widgets) <= 1:
+            return 1
+        if available_width >= SECTION_WIDE_LAYOUT_MIN_WIDTH:
+            return SECTION_MAX_COLUMNS
+        return 1
+
+    def _layout_sections(self, available_width: int | None = None):
+        if not self.widgets:
+            return
+
+        if available_width is None:
+            available_width = max(1, self.canvas.winfo_width())
+
+        columns = self._section_columns(available_width)
+        for col in range(SECTION_MAX_COLUMNS):
+            self.inner.grid_columnconfigure(
+                col,
+                weight=1 if col < columns else 0,
+                uniform="train_sections" if col < columns else "",
+            )
+
+        section_ids = [sid for sid in self.sections.keys() if sid in self.widgets]
+        row_count = (len(section_ids) + columns - 1) // columns
+
+        for idx, section_id in enumerate(section_ids):
+            row = idx // columns
+            col = idx % columns
+            self.widgets[section_id].frame.grid(
+                row=row,
+                column=col,
+                sticky="nsew",
+                padx=SECTION_GRID_PAD_X,
+                pady=SECTION_GRID_PAD_Y,
+            )
+
+        for row in range(max(self._layout_row_count, row_count)):
+            self.inner.grid_rowconfigure(row, weight=1 if row < row_count else 0)
+        self._layout_row_count = row_count
+
     def _ensure_section_by_train(self, train_id: str) -> TrainSectionState:
         if train_id not in self.sections:
             self.sections[train_id] = TrainSectionState(section_id=train_id, train_id=train_id)
@@ -517,6 +585,7 @@ class TrainGuiApp:
     def _refresh_section(self, section_id: str):
         if section_id in self.sections and section_id in self.widgets:
             self.widgets[section_id].set_state(self.sections[section_id])
+            self._layout_sections()
 
     def _remove_section(self, section_id: str):
         st = self.sections.get(section_id)
@@ -532,6 +601,7 @@ class TrainGuiApp:
             self.widgets[section_id].destroy()
             del self.widgets[section_id]
         del self.sections[section_id]
+        self._layout_sections()
 
     def _merge_section_into_train(
         self,
@@ -682,7 +752,7 @@ class TrainGuiApp:
         if img is None:
             return None
 
-        max_w, max_h = 640, 480
+        max_w, max_h = VIDEO_CANVAS_WIDTH, VIDEO_CANVAS_HEIGHT
         h, w = img.shape[:2]
         if w <= 0 or h <= 0:
             return None
