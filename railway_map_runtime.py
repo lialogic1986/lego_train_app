@@ -100,7 +100,7 @@ class RailwayMapRuntime:
                     self.camera_to_train[camera_id] = train_id
                 continue
 
-            if etype == "marker_seen":
+            if etype in ("marker_seen", "marker_distance"):
                 await self.handle_marker_seen(data)
 
     async def handle_marker_seen(self, data: dict):

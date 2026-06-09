@@ -18,6 +18,8 @@ HDR_FMT = "!2sHHHHH"
 HDR_SIZE = struct.calcsize(HDR_FMT)
 FRAME_ID_MOD = 1 << 16
 DEFAULT_FRAME_TIMEOUT_S = 0.10
+DEFAULT_MARKER_DISTANCE_FPS = 10.0
+DEFAULT_MARKER_LOST_TIMEOUT_S = 0.5
 
 
 DEFAULTS = {
@@ -289,7 +291,11 @@ def main():
     ap.add_argument("--snapshot-path", default="", help="Write the latest annotated frame as JPEG")
     ap.add_argument("--snapshot-fps", type=float, default=10.0, help="Max snapshot writes per second")
     ap.add_argument("--camera-id", default="", help="Logical camera_id for event_bus marker events")
-    ap.add_argument("--marker-event-fps", type=float, default=10.0, help="Max ArUco marker events per second")
+    ap.add_argument("--marker-event-fps", type=float, default=None, help="Deprecated alias for --marker-distance-fps")
+    ap.add_argument("--marker-distance-fps", type=float, default=DEFAULT_MARKER_DISTANCE_FPS,
+                    help="Max marker distance updates per second")
+    ap.add_argument("--marker-lost-timeout", type=float, default=DEFAULT_MARKER_LOST_TIMEOUT_S,
+                    help="Seconds without a marker before the next detection emits marker_seen again")
     ap.add_argument("--calib-dist", type=float, default=None)
     ap.add_argument("--ema", type=float, default=None)
     ap.add_argument("--cooldown", type=float, default=None)
@@ -325,7 +331,9 @@ def main():
     detector = make_aruco_detector(dict_name)
     snapshot_writer = SnapshotWriter(args.snapshot_path, fps=args.snapshot_fps) if args.snapshot_path else None
     show_window = not args.no_window
-    marker_event_interval_s = 1.0 / max(0.1, float(args.marker_event_fps))
+    marker_distance_fps = args.marker_event_fps if args.marker_event_fps is not None else args.marker_distance_fps
+    marker_distance_interval_s = 1.0 / max(0.1, float(marker_distance_fps))
+    marker_lost_timeout_s = max(0.05, float(args.marker_lost_timeout))
     bus = None
     if args.camera_id:
         bus = AsyncBusEmitter(f"viewer.{args.camera_id}")
@@ -354,7 +362,9 @@ def main():
     dist_f = None
 
     last_event_ts = {"APPROACH": 0.0, "BRAKE": 0.0, "STOP": 0.0}
-    last_marker_emit_ts = {}
+    last_marker_distance_emit_ts = {}
+    active_marker_id = None
+    last_marker_visible_s = 0.0
 
     last_det_ms = 0.0
     last_rej_n = 0
@@ -366,6 +376,7 @@ def main():
     print(f"[net] listen={listen_ip}:{port} source_ip={source_ip_filter}")
     print(f"[aruco] dict={dict_name}")
     print(f"[range] k_area={k_area:.4f} calib_dist={calib_dist:.2f} ema={ema_alpha} cooldown={cooldown_s}")
+    print(f"[marker] distance_fps<={marker_distance_fps:.1f} lost_timeout={marker_lost_timeout_s:.2f}s")
     print(f"[th] approach<{th_approach:.2f} brake<{th_brake:.2f} stop<{th_stop:.2f}")
     print(f"[video] frame_timeout={frame_timeout_s * 1000.0:.0f} ms (single in-flight frame, drop old on newer frame)")
     if snapshot_writer:
@@ -411,7 +422,10 @@ def main():
 
                         cv2.aruco.drawDetectedMarkers(img, corners, ids)
 
-                    if best is not None:
+                    if best is None:
+                        if active_marker_id is not None and (now_s() - last_marker_visible_s) >= marker_lost_timeout_s:
+                            active_marker_id = None
+                    else:
                         area_px, mid, _c4 = best
                         last_best_id = mid
                         last_best_area = area_px
@@ -424,21 +438,25 @@ def main():
 
                         now = now_s()
                         if dist_f is not None and np.isfinite(dist_f):
-                            last_emit = last_marker_emit_ts.get(mid, 0.0)
-                            if bus and (now - last_emit) >= marker_event_interval_s:
-                                last_marker_emit_ts[mid] = now
-                                bus.emit(
-                                    "marker_seen",
-                                    {
-                                        "camera_id": args.camera_id,
-                                        "marker_id": mid,
-                                        "distance_m": float(dist_f),
-                                        "distance_raw_m": float(dist_raw),
-                                        "area_px": float(area_px),
-                                        "dict": dict_name,
-                                        "ts_ms": int(time.time() * 1000),
-                                    },
-                                )
+                            payload = {
+                                "camera_id": args.camera_id,
+                                "marker_id": mid,
+                                "distance_m": float(dist_f),
+                                "distance_raw_m": float(dist_raw),
+                                "area_px": float(area_px),
+                                "dict": dict_name,
+                                "ts_ms": int(time.time() * 1000),
+                            }
+
+                            if bus and active_marker_id != mid:
+                                bus.emit("marker_seen", payload)
+                                active_marker_id = mid
+
+                            last_marker_visible_s = now
+                            last_emit = last_marker_distance_emit_ts.get(mid, 0.0)
+                            if bus and (now - last_emit) >= marker_distance_interval_s:
+                                last_marker_distance_emit_ts[mid] = now
+                                bus.emit("marker_distance", payload)
 
                             if dist_f < th_stop and (now - last_event_ts["STOP"]) >= cooldown_s:
                                 last_event_ts["STOP"] = now
@@ -457,6 +475,11 @@ def main():
                         fps_print = frames
                         frames = 0
                         last_stat = now
+
+                    # Minimal CV HUD for the dashboard snapshot. GUI Video FPS is only display/read rate.
+                    put(img, f"CV FPS {fps_print}", 5, 16, 0.45)
+                    df = "-" if best is None or dist_f is None or not np.isfinite(dist_f) else f"{dist_f:.2f}m"
+                    put(img, f"distance {df}", 5, 34, 0.45)
 
                     if snapshot_writer:
                         snapshot_writer.write(img)

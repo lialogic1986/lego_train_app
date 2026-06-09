@@ -25,7 +25,7 @@ DEFAULT_FOTA_BIN_PATH = os.path.abspath(
 POWER_STEP = 20
 POWER_MIN = -100
 POWER_MAX = 100
-VIDEO_POLL_MS = 10
+VIDEO_POLL_MS = 20
 VIDEO_CANVAS_WIDTH = 640
 VIDEO_CANVAS_HEIGHT = 480
 INITIAL_WINDOW_WIDTH = 1600
@@ -40,8 +40,11 @@ SECTION_GRID_PAD_Y = 6
 REALTIME_MAP_HEIGHT = 360
 REALTIME_MAP_PADDING_PX = 14
 REALTIME_MAP_RELOAD_INTERVAL_S = 1.0
-REALTIME_MAP_REDRAW_INTERVAL_S = 0.2
+REALTIME_MAP_REDRAW_INTERVAL_S = 0.066
+REALTIME_MAP_ENABLED = True
+LIVE_INFO_ENABLED = True
 LIVE_INFO_UPDATE_INTERVAL_S = 0.25
+GUI_MARKER_DISTANCE_ENABLED = True
 TRAIN_MARKER_STALE_S = 8.0
 
 
@@ -175,18 +178,33 @@ class RealtimeRailwayView:
         self.last_mtime = 0.0
         self.last_reload_s = 0.0
         self.last_redraw_s = 0.0
+        self.map_signature = ""
+        self.static_dirty = True
+        self.transform: dict[str, float] | None = None
+        self.canvas_size: tuple[int, int] = (0, 0)
         self.trains: dict[str, TrainSectionState] = {}
 
     def set_trains(self, trains: dict[str, TrainSectionState]):
         self.trains = trains
 
     def refresh(self, force: bool = False):
+        if not REALTIME_MAP_ENABLED:
+            return
         now = time.monotonic()
         if not force and now - self.last_redraw_s < REALTIME_MAP_REDRAW_INTERVAL_S:
             return
-        self.redraw()
+        self._load_if_needed()
+        w = max(1, self.canvas.winfo_width())
+        h = max(1, self.canvas.winfo_height())
+        if force or self.static_dirty or self.transform is None or self.canvas_size != (w, h):
+            self.redraw()
+            return
+        self._redraw_dynamic()
+        self.last_redraw_s = now
 
     def _load_if_needed(self, force: bool = False):
+        if not REALTIME_MAP_ENABLED:
+            return
         now = time.monotonic()
         if not force and now - self.last_reload_s < REALTIME_MAP_RELOAD_INTERVAL_S:
             return
@@ -219,6 +237,18 @@ class RealtimeRailwayView:
         self.last_mtime = mtime
 
     def _apply_map_data(self, data: dict):
+        signature = json.dumps(
+            {
+                "elements": data.get("elements", []),
+                "markers": data.get("markers", []),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        if signature == self.map_signature:
+            return
+
         self.elements = list(data.get("elements", []))
         self.markers = list(data.get("markers", []))
         self.markers_by_id = {}
@@ -227,27 +257,43 @@ class RealtimeRailwayView:
                 self.markers_by_id[int(marker.get("marker_id"))] = marker
             except (TypeError, ValueError):
                 continue
+        self.map_signature = signature
+        self.static_dirty = True
 
     def redraw(self):
-        self._load_if_needed()
+        if not REALTIME_MAP_ENABLED:
+            self.canvas.delete("all")
+            self.canvas.create_text(
+                max(1, self.canvas.winfo_width()) // 2,
+                max(1, self.canvas.winfo_height()) // 2,
+                text="Realtime map disabled",
+                fill="#b7c8be",
+                font=("Arial", 14),
+            )
+            return
+        self._load_if_needed(force=True)
         self.last_redraw_s = time.monotonic()
-        self.canvas.delete("all")
+        self.canvas.delete("static")
+        self.canvas.delete("dynamic")
 
         w = max(1, self.canvas.winfo_width())
         h = max(1, self.canvas.winfo_height())
+        self.canvas_size = (w, h)
         if not self.elements and not self.markers:
+            self.transform = None
             self.canvas.create_text(
                 w // 2,
                 h // 2,
                 text="No railway_map.json",
                 fill="#b7c8be",
                 font=("Arial", 14),
+                tags=("static",),
             )
             return
 
-        train_positions = self._train_positions()
         bounds = self._bounds()
         if not bounds:
+            self.transform = None
             return
 
         min_x, min_y, max_x, max_y = bounds
@@ -260,6 +306,13 @@ class RealtimeRailwayView:
         scale = max(0.05, scale)
         offset_x = (w - span_x * scale) / 2
         offset_y = (h - span_y * scale) / 2
+        self.transform = {
+            "min_x": min_x,
+            "min_y": min_y,
+            "scale": scale,
+            "offset_x": offset_x,
+            "offset_y": offset_y,
+        }
 
         def sx(x_mm: float) -> float:
             return offset_x + (x_mm - min_x) * scale
@@ -272,16 +325,32 @@ class RealtimeRailwayView:
             self._draw_track(elem, sx, sy, scale)
         for marker in self.markers:
             self._draw_marker(marker, sx, sy, scale)
+        self.static_dirty = False
+        self._redraw_dynamic()
+
+    def _redraw_dynamic(self):
+        if self.transform is None:
+            return
+        self.canvas.delete("dynamic")
+        train_positions = self._train_positions()
+        transform = self.transform
+
+        def sx(x_mm: float) -> float:
+            return transform["offset_x"] + (x_mm - transform["min_x"]) * transform["scale"]
+
+        def sy(y_mm: float) -> float:
+            return transform["offset_y"] + (y_mm - transform["min_y"]) * transform["scale"]
+
         for train_id, pos in train_positions.items():
-            self._draw_train(train_id, pos, sx, sy, scale)
+            self._draw_train(train_id, pos, sx, sy, transform["scale"])
 
     def _draw_background(self, w: int, h: int):
-        self.canvas.create_rectangle(0, 0, w, h, fill="#18241f", outline="")
+        self.canvas.create_rectangle(0, 0, w, h, fill="#18241f", outline="", tags=("static",))
         step = 48
         for x in range(0, w + step, step):
-            self.canvas.create_line(x, 0, x, h, fill="#20332b")
+            self.canvas.create_line(x, 0, x, h, fill="#20332b", tags=("static",))
         for y in range(0, h + step, step):
-            self.canvas.create_line(0, y, w, y, fill="#20332b")
+            self.canvas.create_line(0, y, w, y, fill="#20332b", tags=("static",))
 
     def _draw_track(self, elem: dict, sx, sy, scale: float):
         kind = elem.get("kind", "straight")
@@ -304,8 +373,8 @@ class RealtimeRailwayView:
 
         ballast_w = max(10, int(22 * min(scale, 1.4)))
         rail_w = max(3, int(5 * min(scale, 1.3)))
-        self.canvas.create_line(*coords, fill="#4d4b45", width=ballast_w, capstyle="round", joinstyle="round", smooth=len(points) > 2)
-        self.canvas.create_line(*coords, fill="#a9b0aa", width=rail_w, capstyle="round", joinstyle="round", smooth=len(points) > 2)
+        self.canvas.create_line(*coords, fill="#4d4b45", width=ballast_w, capstyle="round", joinstyle="round", smooth=len(points) > 2, tags=("static",))
+        self.canvas.create_line(*coords, fill="#a9b0aa", width=rail_w, capstyle="round", joinstyle="round", smooth=len(points) > 2, tags=("static",))
 
         if len(points) == 2:
             self._draw_sleepers(points[0], points[1], sx, sy, scale)
@@ -334,6 +403,7 @@ class RealtimeRailwayView:
                 sy(y + py * sleeper_half),
                 fill="#806b4b",
                 width=max(2, int(4 * min(scale, 1.0))),
+                tags=("static",),
             )
 
     def _draw_marker(self, marker: dict, sx, sy, scale: float):
@@ -351,9 +421,9 @@ class RealtimeRailwayView:
         front = rotate_point(0, -38, rotation)
         fx = sx(x_mm + front[0])
         fy = sy(y_mm + front[1])
-        self.canvas.create_polygon(x, y, fx - 8, fy + 8, fx + 8, fy + 8, fill="#2c89c8", outline="#8bd4ff")
-        self.canvas.create_rectangle(x - size, y - size, x + size, y + size, fill="#f2f6f8", outline="#8bd4ff", width=2)
-        self.canvas.create_text(x, y, text=str(marker_id), fill="#0d1b24", font=("Arial", max(8, int(size)), "bold"))
+        self.canvas.create_polygon(x, y, fx - 8, fy + 8, fx + 8, fy + 8, fill="#2c89c8", outline="#8bd4ff", tags=("static",))
+        self.canvas.create_rectangle(x - size, y - size, x + size, y + size, fill="#f2f6f8", outline="#8bd4ff", width=2, tags=("static",))
+        self.canvas.create_text(x, y, text=str(marker_id), fill="#0d1b24", font=("Arial", max(8, int(size)), "bold"), tags=("static",))
 
     def _draw_train(self, train_id: str, pos: dict, sx, sy, scale: float):
         x_mm = pos["x_mm"]
@@ -371,9 +441,9 @@ class RealtimeRailwayView:
             py = y + side[1] * lx + front[1] * ly
             pts.extend((px, py))
         fill = "#ffcf33" if pos.get("online", False) else "#8c8c8c"
-        self.canvas.create_polygon(*pts, fill=fill, outline="#161616", width=2)
+        self.canvas.create_polygon(*pts, fill=fill, outline="#161616", width=2, tags=("dynamic",))
         label = train_id[-8:] if len(train_id) > 8 else train_id
-        self.canvas.create_text(x, y + length * 0.75, text=label, fill="#e7f1ea", font=("Arial", 10, "bold"))
+        self.canvas.create_text(x, y + length * 0.75, text=label, fill="#e7f1ea", font=("Arial", 10, "bold"), tags=("dynamic",))
 
     def _render_info_panel(self, train_positions: dict[str, dict], unmapped_markers: list[dict]):
         self.info.configure(state="normal")
@@ -549,6 +619,13 @@ class RealtimeRailwayView:
         )
 
     def section_info(self, section_id: str, st: TrainSectionState) -> dict:
+        if not REALTIME_MAP_ENABLED:
+            return {
+                "status": "disabled",
+                "map_sign_ids": [],
+                "track_count": 0,
+                "marker_count": 0,
+            }
         self._load_if_needed()
         info = {
             "status": "waiting",
@@ -1315,19 +1392,23 @@ class TrainGuiApp:
 
         for row in range(max(self._layout_row_count, row_count)):
             self.inner.grid_rowconfigure(row, weight=0)
-        viewport_h = max(1, self.canvas.winfo_height())
-        train_rows_h = row_count * (VIDEO_CANVAS_HEIGHT + 52)
-        map_h = max(260, viewport_h - train_rows_h - 46)
-        self.realtime_map.canvas.configure(height=map_h)
-        self.realtime_map.frame.grid(
-            row=row_count,
-            column=0,
-            columnspan=columns,
-            sticky="nsew",
-            padx=SECTION_GRID_PAD_X,
-            pady=(SECTION_GRID_PAD_Y, SECTION_GRID_PAD_Y + 8),
-        )
-        self.inner.grid_rowconfigure(row_count, weight=1)
+        if REALTIME_MAP_ENABLED:
+            viewport_h = max(1, self.canvas.winfo_height())
+            train_rows_h = row_count * (VIDEO_CANVAS_HEIGHT + 52)
+            map_h = max(260, viewport_h - train_rows_h - 46)
+            self.realtime_map.canvas.configure(height=map_h)
+            self.realtime_map.frame.grid(
+                row=row_count,
+                column=0,
+                columnspan=columns,
+                sticky="nsew",
+                padx=SECTION_GRID_PAD_X,
+                pady=(SECTION_GRID_PAD_Y, SECTION_GRID_PAD_Y + 8),
+            )
+            self.inner.grid_rowconfigure(row_count, weight=1)
+        else:
+            self.realtime_map.frame.grid_remove()
+            self.inner.grid_rowconfigure(row_count, weight=0)
         self._layout_row_count = row_count
 
     def _layout_diagnostics(self):
@@ -1352,7 +1433,8 @@ class TrainGuiApp:
     def _layout_all_sections(self):
         self._layout_sections()
         self._layout_diagnostics()
-        self.realtime_map.set_trains(self.sections)
+        if REALTIME_MAP_ENABLED:
+            self.realtime_map.set_trains(self.sections)
 
     def _ensure_section_by_train(self, train_id: str) -> TrainSectionState:
         if train_id not in self.sections:
@@ -1381,12 +1463,12 @@ class TrainGuiApp:
         if section_id in self.sections and section_id in self.widgets:
             self.widgets[section_id].set_state(self.sections[section_id])
             now = time.monotonic()
-            if layout or now - self._last_live_info_s.get(section_id, 0.0) >= LIVE_INFO_UPDATE_INTERVAL_S:
+            if LIVE_INFO_ENABLED and (layout or now - self._last_live_info_s.get(section_id, 0.0) >= LIVE_INFO_UPDATE_INTERVAL_S):
                 self.widgets[section_id].set_live_info(self._dashboard_info_parts(section_id))
                 self._last_live_info_s[section_id] = now
             if layout:
                 self._layout_all_sections()
-            if refresh_map:
+            if refresh_map and REALTIME_MAP_ENABLED:
                 self.realtime_map.refresh()
 
     def _remove_section(self, section_id: str):
@@ -1684,7 +1766,10 @@ class TrainGuiApp:
                 st.lego_last_seen = time.monotonic()
                 self._refresh_section(train_id, layout=False, refresh_map=True)
 
-        elif etype == "marker_seen":
+        elif etype in ("marker_seen", "marker_distance"):
+            if etype == "marker_distance" and not GUI_MARKER_DISTANCE_ENABLED:
+                return
+
             train_id = data.get("train_id", "")
             camera_id = data.get("camera_id", "")
             section_id = train_id if train_id in self.sections else self.camera_to_section.get(camera_id, "")
@@ -1766,7 +1851,8 @@ class TrainGuiApp:
             if st.removable:
                 self._remove_section(section_id)
 
-        self.realtime_map.refresh()
+        if REALTIME_MAP_ENABLED:
+            self.realtime_map.refresh()
         self.root.after(1000, self._housekeeping)
 
 
